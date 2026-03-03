@@ -1,0 +1,273 @@
+"""Centralized prompt templates for all agents.
+
+Edit this file to tune agent behavior without touching agent logic.
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYZER AGENT  (scores scanned TODO items before user review)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyzer_todo(file_path: str, line_number: int, raw_text: str,
+                  description: str, repo_path: str) -> str:
+    """Prompt asking the model to evaluate a TODO on feasibility and implementation difficulty.
+
+    Output must be a single JSON object with exactly these keys:
+      feasibility_score   float 0-10  (should/can this be done now by an automated agent?)
+      difficulty_score    float 0-10  (how hard to implement correctly? higher = harder)
+      note                str         (two sentences: one for feasibility, one for difficulty)
+
+    feasibility_score rubric:
+      0-3  : Not actionable — already fixed elsewhere, depends on unresolved external
+             prerequisites, conceptually wrong/outdated, or requires human decisions
+             outside an automated agent's scope.
+      4-6  : Doable but with caveats — some design uncertainty, minor blockers, or unclear
+             whether the original author's intent is still valid.
+      7-10 : Ready to implement now — clear goal, self-contained, no known blockers.
+
+    difficulty_score rubric:
+      0-3  : Trivial — one-liner or obvious rename, zero risk of breaking anything.
+      4-6  : Moderate — touches a few files, straightforward logic, limited blast radius.
+      7-9  : Hard — involves multiple subsystems, non-trivial algorithm, or carries
+             meaningful risk of introducing regressions.
+      10   : Extremely hard — deep architectural change across the whole codebase.
+    """
+    return f"""You are a code analysis agent. Evaluate the following TODO comment.
+
+Repository: {repo_path}
+File: {file_path}:{line_number}
+Raw comment: {raw_text}
+Extracted description: {description}
+
+Your job:
+1. Read the file at the given path and examine the surrounding context (at least 40 lines
+   around line {line_number}) to understand exactly what the TODO requires.
+2. Check whether the described functionality already exists elsewhere in the codebase or
+   whether there are unresolved prerequisites that would block an automated agent.
+3. Score feasibility: how much does this TODO make sense to tackle right now, automatically?
+4. Score difficulty: how hard would it be for a skilled coding agent to implement it
+   correctly (including tests passing, no regressions)?
+
+Output ONLY a valid JSON object — no markdown fences, no preamble.
+Example:
+{{"feasibility_score": 7.5, "difficulty_score": 4.0, "note": "The cache eviction path is absent and clearly needed; the fix is localised to one file so difficulty is moderate."}}"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLANNER AGENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def planner_plan_task(title: str, description: str, file_path: str,
+                      line_number: int, repo_path: str) -> str:
+    """Prompt for analyzing a single task and producing an implementation plan."""
+    return f"""You are a planning agent. Analyze the following task and create a \
+concise implementation plan. Output ONLY the plan as a numbered list of steps.
+
+Task: {title}
+Description: {description}
+File: {file_path}:{line_number}
+Repository: {repo_path}
+
+Requirements:
+1. Identify which files need to be modified
+2. Describe the specific changes needed
+3. Note any potential risks or dependencies
+4. Keep the plan actionable and specific
+
+Directly output your plan, including a clear and explicit statement of the overall objectives and implementation strategies. The specific implementation plan must be listed clearly item by item."""
+
+
+def planner_analyze_and_split(title: str, description: str, repo_path: str) -> str:
+    """Unified prompt: assess complexity, decide whether to split, produce plan or sub-tasks.
+
+    Output JSON keys:
+      complexity   str   one of: very_complex / complex / medium / simple
+      split        bool  whether to decompose into sub-tasks
+      reason       str   one-sentence justification for both decisions
+      plan         str   (only when split=false) numbered implementation steps
+      sub_tasks    list  (only when split=true) [{title, description, priority}, ...]
+    """
+    return f"""You are a planning agent. Analyze the following task and produce a structured plan.
+
+Task title: {title}
+Task description: {description}
+Repository: {repo_path}
+
+Step 1 — Assess complexity. Choose ONE label:
+  very_complex : Requires deep understanding of multiple subsystems, likely touches >10 files,
+                 high risk of breaking existing behaviour, needs the most capable model.
+  complex      : Touches several modules or requires careful design, moderate risk.
+  medium       : Clear scope, a few files, straightforward logic.
+  simple       : Trivial fix or one-liner, low risk, small model is sufficient.
+
+Step 2 — Decide splitting. Split into independent parallel sub-tasks ONLY if:
+  - The task clearly contains multiple independent concerns in different modules/files AND
+  - Parallelising would save meaningful time.
+  Prefer NOT splitting. Touching 2-3 related files should NOT be split. Max 6 sub-tasks.
+  Sub-tasks must be fully independent (no ordering dependency between them).
+
+Step 3 — Produce the output. Output ONLY valid JSON (no markdown fences).
+
+If single task:
+{{"complexity": "medium", "split": false, "reason": "...", "plan": "Overall objective: ...\\n1. ...\\n2. ..."}}
+
+If split:
+{{"complexity": "complex", "split": true, "reason": "...", "sub_tasks": [
+  {{"title": "Fix X", "description": "Modify file Y to ...", "priority": "medium"}}
+]}}"""
+
+
+def planner_decompose_task(description: str, repo_path: str) -> str:
+    """Prompt for breaking a complex task into parallel sub-tasks."""
+    return f"""You are a planning agent. Break down the following complex task into \
+independent sub-tasks that can be worked on in parallel.
+
+Task: {description}
+Repository: {repo_path}
+
+Output a JSON array of sub-tasks. Each sub-task should have:
+- "title": short title
+- "description": detailed description including which files to modify
+- "priority": "high", "medium", or "low"
+
+Output ONLY valid JSON, no other text. Example:
+[{{"title": "Fix X", "description": "Modify file Y to ...", "priority": "medium"}}]"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CODER AGENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def coder_implement(title: str, description: str, file_path: str,
+                    line_number: int, plan_output: str) -> str:
+    """Prompt for implementing a task in the worktree."""
+    parts = [
+        "You are a coding agent. Implement the following task completely. You must first read the AGENTS.md within the project to understand the relevant specifications and strictly enforce them.",
+        "",
+        f"## Task: {title}",
+        "",
+        "## Description",
+        description,
+        "",
+        "## Delivery Requirements",
+        "The set of modifications for this task needs to form a correct git commit, so that it can directly be used as a qualified Pull Request. The commit should not include irrelevant changes such as environment setup.",
+        "",
+    ]
+    if file_path:
+        parts += [
+            "",
+            "## Target File",
+            f"{file_path}:{line_number}",
+        ]
+    if plan_output:
+        parts += [
+            "",
+            "## Implementation Plan",
+            plan_output,
+        ]
+    parts += [
+        "",
+        "## Requirements",
+        "1. Make the minimal necessary changes to resolve this task",
+        "2. Follow existing code style and conventions",
+        "3. You must actually execute compilation and testing (if any) to verify the correctness of the code",
+        "4. Do not introduce new TODOs",
+        "5. Use ONLY relative file paths (never absolute paths)",
+        "6. Ensure the commit content is correct, the final commit(s) submitted by you will be reviewed by the reviewer",
+    ]
+    return "\n".join(parts)
+
+
+def coder_retry_feedback(review_feedback: str, attempt: int) -> str:
+    """Concise prompt for continued coder sessions — only sends the review
+    feedback since the session already has full task context."""
+    return (
+        f"## Review Feedback (attempt {attempt})\n"
+        f"{review_feedback}\n\n"
+        "Please confirm whether the issues/optimization suggestions mentioned in the review are present/feasible, and if there are no issues, modify the code according to the suggestions."
+        "You still need to follow the instructions in AGENTS.md, but the environment part should already be ready as you just used it. Make sure the tests pass after the modifications and that the code is organized to be basically the clearest."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REVIEWER AGENT
+# ─────────────────────────────────────────────────────────────────────────────
+REVIEW_REQUIREMENTS="""
+## Instructions
+The coding agent has already committed its changes to this repository's git history. You should only focus on the content of the commits; the content in the working area that has not been committed is NOT part of the submission and does not require review.
+Use the available tools to inspect the work:
+  - Run `git log --oneline -5` to see recent commits.
+  - Run `git show HEAD` (may with appropriate offset) to view the content of the commits. DON'T use `git diff` because it shows the diff between the working area.
+  - Read any modified files to check correctness and style.
+
+When reviewing, you must strictly follow AGENTS.md and the related skills. In addition, you can perform any desired review operations to observe suspicious code and details in order to identify issues as much as possible.
+
+## Output Format
+Start your review with either APPROVE or REQUEST_CHANGES on the first line. nothing else in this line.
+Then provide specific feedback. Review comments should concisely point out the issues and provide relevant examples or context to explain the current problem.
+"""
+
+
+def reviewer_review(title: str, description: str, revision_context: str = "") -> str:
+    """Prompt for reviewing code changes produced by the coder agent.
+
+    The reviewer runs as a full opencode agent inside the worktree where the
+    coder has already committed its work.  It is free to use git log, git diff,
+    read files, etc. to form its judgement.
+    """
+    revision_block = ""
+    if revision_context:
+        revision_block = (
+            f"## Revision Context"
+            f"The user provided the following manual feedback to the coder. "
+            f"Verify that the coder has addressed it:\n{revision_context}"
+        )
+    return f"""You are a code review agent.
+
+## Task that was implemented
+Title: {title}
+Description: {description}
+
+{revision_block}
+
+{REVIEW_REQUIREMENTS}
+"""
+
+
+def reviewer_review_patch(title: str, review_input: str,
+                          revision_context: str = "") -> str:
+    """Prompt for reviewing a user-supplied patch, PR link, or code snippet.
+
+    Unlike reviewer_review(), this is used for review-only tasks where no
+    coder agent was involved.  The reviewer should fetch / read the provided
+    material and produce a thorough code review.
+    """
+    revision_block = ""
+    if revision_context:
+        revision_block = f"""## Additional Review Instructions (from user)
+The user has provided additional review guidance. Pay special attention to these points:
+{revision_context}
+"""
+    return f"""You are a code review agent.
+
+## Review Request
+Title: {title}
+{revision_block}
+## Material to Review
+{review_input}
+
+## Instructions
+The user has provided the above material for you to review. It may be:
+  - A patch / diff pasted inline
+  - A GitHub PR or commit URL (use `curl` or the available tools to fetch it)
+  - A description of changes with file references
+Note that the content of this PR may not be present in the current codebase, so the newly added content cannot be found locally. Please combine the codebase and the actual content of the patch/PR for review.
+
+Depending on the material type:
+  - For inline patches/diffs: analyze the diff directly.
+  - For GitHub URLs: fetch the diff with `curl -sL <url>.diff` (append .diff to PR URLs) and review it.
+  - For file references: read the files in the repository to understand the changes.
+  - You can also use `git log`, `git show`, `git diff` etc. as needed.
+
+{REVIEW_REQUIREMENTS}
+"""

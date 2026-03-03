@@ -1,0 +1,69 @@
+# Multi-Agent TODO Resolver Configuration
+# Copy this file to config.yaml and edit the values below.
+
+# Target repository to work on
+repo:
+  path: /path/to/your/repository
+  # Base branch for creating worktrees
+  base_branch: master
+  # Directory to store worktrees (absolute path recommended)
+  worktree_dir: /path/to/multi-agent-todo/worktrees
+  # Scripts to run inside the worktree after it is created (relative to repo root or absolute).
+  # They are executed in order; a non-zero exit code aborts the task with an error.
+  # Example: a script that builds compile_commands.json or installs project dependencies.
+  worktree_hooks: []
+  #  - hooks/setup_worktree.sh
+
+# OpenCode settings
+opencode:
+  # Model for planning tasks (complexity assessment, sub-task splitting)
+  planner_model: your-provider/planner-model
+  # Coder model selected by task complexity (planner assigns one of: very_complex/complex/medium/simple)
+  coder_model_by_complexity:
+    very_complex: your-provider/strongest-model
+    complex: your-provider/strongest-model
+    medium: your-provider/balanced-model
+    simple: your-provider/fast-model
+  # Fallback coder model if complexity is unrecognised
+  coder_model_default: your-provider/balanced-model
+  # Reviewer models — ALL must approve for a task to pass
+  # Using multiple diverse models improves review quality
+  reviewer_models:
+    - your-provider/reviewer-model-1
+    - your-provider/reviewer-model-2
+  # Timeout in seconds for a single opencode run
+  timeout: 3600
+
+# Orchestrator settings
+orchestrator:
+  # Max parallel tasks (each gets its own worktree)
+  max_parallel_tasks: 3
+  # Max coding retries after review requests changes (total attempts = max_retries + 1)
+  max_retries: 4
+  # Polling interval in seconds
+  poll_interval: 30
+  # Auto-scan for TODOs on startup
+  auto_scan_todos: false
+
+# Environment variables injected into every worktree hook script
+hook_env: {}
+#  ROOT_WORKSPACE_PATH: /path/to/your/repository
+
+# Web dashboard
+web:
+  host: 0.0.0.0
+  port: 8778
+
+# Repository publish settings (used by the Publish button)
+publish:
+  # Remote to push completed branches to
+  remote: origin
+
+# Logging
+logging:
+  level: INFO
+  file: /path/to/multi-agent-todo/logs/agent.log
+
+# Persistence
+database:
+  path: /path/to/multi-agent-todo/data/tasks.db

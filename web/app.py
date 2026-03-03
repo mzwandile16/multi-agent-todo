@@ -1,0 +1,1817 @@
+"""FastAPI web dashboard for observing and managing the multi-agent system."""
+
+import os
+import subprocess
+import time
+from typing import Optional
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from core.orchestrator import Orchestrator
+from core.opencode_client import OpenCodeClient
+
+app = FastAPI(title="Multi-Agent TODO Resolver")
+
+# Will be set by the daemon
+orchestrator: Optional[Orchestrator] = None
+
+
+def set_orchestrator(orch: Orchestrator):
+    global orchestrator
+    orchestrator = orch
+
+
+def _evaluate_review_verdict(review_text: str) -> str:
+    """Determine APPROVE / REQUEST_CHANGES from reviewer output text.
+
+    Mirrors ReviewerAgent._evaluate_review but returns a string verdict.
+    """
+    upper = review_text.upper()
+    if "APPROVE" in upper and "REQUEST_CHANGES" not in upper:
+        return "approve"
+    if "REQUEST_CHANGES" in upper:
+        return "request_changes"
+    positive = ["LGTM", "LOOKS GOOD", "APPROVED", "NO ISSUES"]
+    negative = ["BUG", "ERROR", "INCORRECT", "WRONG", "MISSING", "SHOULD BE"]
+    pos = sum(1 for p in positive if p in upper)
+    neg = sum(1 for n in negative if n in upper)
+    return "approve" if pos > neg else "request_changes"
+
+
+# ── API Routes ───────────────────────────────────────────────────────
+
+@app.get("/api/status")
+async def api_status():
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    return orchestrator.get_status()
+
+
+@app.get("/api/tasks")
+async def api_tasks(status: Optional[str] = None):
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    tasks = orchestrator.db.get_all_tasks()
+    if status:
+        tasks = [t for t in tasks if t.status.value == status]
+    tasks.sort(key=lambda t: t.created_at, reverse=True)
+    return [t.to_dict() for t in tasks]
+
+
+@app.get("/api/tasks/{task_id}")
+async def api_task_detail(task_id: str):
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    task = orchestrator.db.get_task(task_id)
+    if not task:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    runs = orchestrator.db.get_runs_for_task(task_id)
+    client = orchestrator.client
+    parsed_runs = []
+    for r in runs:
+        rd = r.to_dict()
+        rd["parsed"] = client.parse_readable_output(r.output)
+        # For reviewer runs, determine the verdict from the output text
+        if r.agent_type == "reviewer":
+            rd["review_verdict"] = _evaluate_review_verdict(
+                client.extract_text_response(r.output)
+            )
+        # Don't send raw output to frontend (too large) — except manual_review
+        if r.agent_type != "manual_review":
+            rd.pop("output", None)
+        rd.pop("prompt", None)
+        parsed_runs.append(rd)
+    # Fetch live git status for the worktree (empty dict if no worktree yet)
+    git_status = {}
+    if task.worktree_path:
+        git_status = orchestrator.worktree_mgr.get_git_status(task.worktree_path)
+
+    return {
+        "task": task.to_dict(),
+        "runs": parsed_runs,
+        "git_status": git_status,
+    }
+
+
+@app.post("/api/tasks")
+async def api_add_task(request: Request):
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    # Parse copy_files: newline-separated list of relative paths
+    copy_raw = body.get("copy_files", "")
+    copy_files = [f.strip() for f in copy_raw.split("\n") if f.strip()] if copy_raw else []
+    task = orchestrator.submit_task(
+        title=body.get("title", "Untitled"),
+        description=body.get("description", ""),
+        priority=body.get("priority", "medium"),
+        copy_files=copy_files,
+    )
+    return task.to_dict()
+
+
+@app.post("/api/tasks/review")
+async def api_add_review_task(request: Request):
+    """Submit a review-only task (no coding, just runs reviewers)."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    title = body.get("title", "").strip()
+    review_input = body.get("review_input", "").strip()
+    if not review_input:
+        return JSONResponse({"error": "review_input required"}, status_code=400)
+    copy_raw = body.get("copy_files", "")
+    copy_files = [f.strip() for f in copy_raw.split("\n") if f.strip()] if copy_raw else []
+    task = orchestrator.submit_review_task(
+        title=title or "Review Task",
+        review_input=review_input,
+        priority=body.get("priority", "medium"),
+        copy_files=copy_files,
+    )
+    return task.to_dict()
+
+
+@app.post("/api/tasks/{task_id}/dispatch")
+async def api_dispatch_task(task_id: str):
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    ok = orchestrator.dispatch_task(task_id)
+    return {"dispatched": ok}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def api_cancel_task(task_id: str):
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    ok = orchestrator.cancel_task(task_id)
+    return {"cancelled": ok}
+
+
+@app.post("/api/tasks/{task_id}/clean")
+async def api_clean_task(task_id: str):
+    """Remove worktree and branch of a finished task to free resources."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    result = orchestrator.clean_task(task_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.post("/api/tasks/{task_id}/publish")
+async def api_publish_task(task_id: str):
+    """Push a completed task's branch to the configured remote."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    result = orchestrator.publish_task(task_id)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.post("/api/tasks/{task_id}/revise")
+async def api_revise_task(task_id: str, request: Request):
+    """Re-open a completed/failed task with manual review feedback."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    feedback = body.get("feedback", "").strip()
+    if not feedback:
+        return JSONResponse({"error": "feedback required"}, status_code=400)
+    result = orchestrator.revise_task(task_id, feedback)
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return result
+
+
+@app.post("/api/tasks/{task_id}/exec")
+async def api_exec_in_worktree(task_id: str, request: Request):
+    """Execute a shell command inside a task's worktree directory."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    task = orchestrator.db.get_task(task_id)
+    if not task:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    if not task.worktree_path or not os.path.isdir(task.worktree_path):
+        return JSONResponse({"error": "Worktree not available"}, status_code=400)
+    body = await request.json()
+    cmd = body.get("command", "").strip()
+    if not cmd:
+        return JSONResponse({"error": "command required"}, status_code=400)
+    try:
+        result = subprocess.run(
+            cmd, shell=True, cwd=task.worktree_path,
+            capture_output=True, text=True, timeout=30,
+        )
+        return {
+            "stdout": result.stdout[-8000:] if len(result.stdout) > 8000 else result.stdout,
+            "stderr": result.stderr[-4000:] if len(result.stderr) > 4000 else result.stderr,
+            "exit_code": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"error": "Command timed out (30s limit)"}, status_code=408)
+
+
+@app.get("/api/todos")
+async def api_get_todos():
+    """List all scanned TODO items."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    items = orchestrator.db.get_all_todo_items()
+    return [i.to_dict() for i in items]
+
+
+@app.post("/api/todos/scan")
+async def api_scan_todos(request: Request):
+    """Scan repo for new TODO comments and store them as TodoItems."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    subdir = str(body.get("subdir", "")).strip()
+    limit = int(body.get("limit", 0))
+    new_items = orchestrator.scan_todos_raw(subdir=subdir, limit=limit)
+    return {"scanned": len(new_items), "items": new_items}
+
+
+@app.get("/api/config")
+async def api_config():
+    """Return a safe subset of the current config for the frontend info panel."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    cfg = orchestrator.config
+    repo = cfg.get("repo", {})
+    oc = cfg.get("opencode", {})
+    orch = cfg.get("orchestrator", {})
+    return {
+        "repo_path": repo.get("path", ""),
+        "base_branch": repo.get("base_branch", ""),
+        "worktree_dir": repo.get("worktree_dir", ""),
+        "worktree_hooks": repo.get("worktree_hooks", []),
+        "planner_model": oc.get("planner_model", ""),
+        "coder_model_by_complexity": oc.get("coder_model_by_complexity", {}),
+        "coder_model_default": oc.get("coder_model_default", ""),
+        "reviewer_models": oc.get("reviewer_models", []),
+        "max_retries": orch.get("max_retries", 4),
+        "publish_remote": cfg.get("publish", {}).get("remote", "origin"),
+    }
+
+
+@app.post("/api/config")
+async def api_update_config(request: Request):
+    """Update model configuration at runtime."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    try:
+        orchestrator.update_models(body)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.get("/api/models")
+async def api_models():
+    """Return available opencode model IDs by running `opencode models`."""
+    import subprocess as _sp
+    try:
+        out = _sp.check_output(["opencode", "models"], text=True, timeout=10)
+        models = sorted(line.strip() for line in out.splitlines() if line.strip())
+        return {"models": models}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/todos/{todo_id}/analyze")
+async def api_analyze_todo(todo_id: str):
+    """Run the analyzer agent on a single TodoItem.
+    Returns 409 if already analyzing or dispatched; 404 if not found; 500 on agent error.
+    """
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    result = orchestrator.analyze_todo_item(todo_id)
+    if "error" in result:
+        http_status = result.pop("status", 400)
+        return JSONResponse(result, status_code=http_status)
+    return result
+
+
+@app.get("/api/todos/queue")
+async def api_todo_queue():
+    """Return all TodoItems currently being analyzed (status=analyzing)."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    items = orchestrator.db.get_all_todo_items()
+    analyzing = [i.to_dict() for i in items
+                 if i.status.value == "analyzing"]
+    return {"analyzing": analyzing, "count": len(analyzing)}
+
+
+@app.post("/api/todos/dispatch")
+async def api_dispatch_todos(request: Request):
+    """Send selected TODO items to the planner (creates pending tasks)."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not ids:
+        return JSONResponse({"error": "ids required"}, status_code=400)
+    tasks = orchestrator.dispatch_todos_to_planner(ids)
+    return {"dispatched": len(tasks), "tasks": tasks}
+
+
+@app.post("/api/todos/revert")
+async def api_revert_todos(request: Request):
+    """Revert dispatched TODO items back to analyzed status."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not ids:
+        return JSONResponse({"error": "ids required"}, status_code=400)
+    count = orchestrator.revert_todo_items(ids)
+    return {"reverted": count}
+
+
+@app.post("/api/todos/delete")
+async def api_delete_todos(request: Request):
+    """Delete selected TODO items."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    body = await request.json()
+    ids = body.get("ids", [])
+    count = orchestrator.delete_todo_items(ids)
+    return {"deleted": count}
+
+
+@app.post("/api/dispatch-all")
+async def api_dispatch_all():
+    """Dispatch all pending tasks."""
+    if not orchestrator:
+        return JSONResponse({"error": "Not initialized"}, status_code=503)
+    pending = orchestrator.db.get_pending_tasks()
+    dispatched = 0
+    for t in pending:
+        if orchestrator.dispatch_task(t.id):
+            dispatched += 1
+    return {"dispatched": dispatched, "total_pending": len(pending)}
+
+
+# ── Dashboard HTML ───────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return DASHBOARD_HTML
+
+
+def _fmt_time(ts):
+    if ts == 0:
+        return "-"
+    import datetime
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Agent TODO Resolver</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+    --orange: #f0883e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--text); line-height: 1.5; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+  header { display: flex; justify-content: space-between; align-items: center;
+           padding: 16px 0; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  header h1 { font-size: 20px; font-weight: 600; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+           gap: 12px; margin-bottom: 24px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border);
+               border-radius: 8px; padding: 16px; text-align: center; }
+  .stat-card .num { font-size: 28px; font-weight: 700; }
+  .stat-card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; }
+  .actions { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+  .btn { padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px;
+         background: var(--surface); color: var(--text); cursor: pointer; font-size: 13px;
+         transition: all 0.15s; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+  .btn-primary { background: #238636; border-color: #238636; color: white; }
+  .btn-primary:hover { background: #2ea043; }
+  .task-table { width: 100%; border-collapse: collapse; }
+  .task-table th, .task-table td { padding: 10px 12px; text-align: left;
+    border-bottom: 1px solid var(--border); font-size: 13px; }
+  .task-table th { color: var(--text-dim); font-weight: 600; background: var(--surface); position: sticky; top: 0; }
+  .task-table tr:hover { background: rgba(88,166,255,0.04); }
+  .badge { padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; display: inline-block; }
+  .badge-pending { background: #30363d; color: var(--text-dim); }
+  .badge-planning { background: #1f2d3d; color: var(--purple); }
+  .badge-coding { background: #0d2d42; color: var(--accent); }
+  .badge-reviewing { background: #2a1f0d; color: var(--yellow); }
+  .badge-completed { background: #0d2d1a; color: var(--green); }
+  .badge-failed, .badge-review_failed { background: #2d0d0d; color: var(--red); }
+  .badge-cancelled { background: #30363d; color: var(--text-dim); }
+  .badge-high { color: var(--red); } .badge-medium { color: var(--yellow); }
+  .badge-low { color: var(--text-dim); }
+  .sys-select { width: 100%; padding: 5px 8px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px; color: var(--text);
+    font-size: 12px; font-family: monospace; cursor: pointer; }
+  .sys-select:focus { outline: none; border-color: var(--accent); }
+  .sys-select option { background: var(--surface); color: var(--text); }
+  .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.6); z-index: 100; justify-content: center; align-items: flex-start;
+    padding-top: 40px; overflow-y: auto; }
+  .modal-overlay.active { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+           padding: 24px; width: 500px; max-width: 90vw; margin-bottom: 40px; }
+  .modal-wide { width: 900px; max-height: 85vh; overflow-y: auto; }
+  .modal h2 { margin-bottom: 16px; font-size: 16px; }
+  .modal input, .modal textarea, .modal select { width: 100%; padding: 8px 12px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); margin-bottom: 12px; font-family: inherit; font-size: 13px; }
+  .modal textarea { min-height: 100px; resize: vertical; }
+
+  /* Detail page sections */
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .detail-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .detail-card h4 { font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }
+  .detail-card .val { font-size: 13px; word-break: break-all; }
+  .detail-section { margin-bottom: 16px; }
+  .detail-section h3 { font-size: 14px; color: var(--text); margin-bottom: 8px; font-weight: 600;
+    border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .detail-section pre { background: var(--bg); padding: 12px; border-radius: 6px;
+    font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+    max-height: 500px; overflow-y: auto; border: 1px solid var(--border); }
+
+  /* Session info */
+  .session-box { background: #0d1d2d; border: 1px solid #1f3d5d; border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 12px; font-size: 12px; }
+  .session-box .session-label { color: var(--accent); font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.5px; }
+  .session-box code { color: var(--accent); background: rgba(88,166,255,0.1); padding: 2px 6px;
+    border-radius: 4px; font-size: 12px; user-select: all; }
+  .session-box .cmd { color: var(--text-dim); margin-top: 4px; font-family: monospace; font-size: 11px; user-select: all; }
+
+  /* Agent run card */
+  .run-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 12px; overflow: hidden; }
+  .run-header { display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; background: rgba(255,255,255,0.02); cursor: pointer;
+    border-bottom: 1px solid var(--border); }
+  .run-header:hover { background: rgba(255,255,255,0.04); }
+  .run-header .run-title { font-weight: 600; font-size: 13px; }
+  .run-header .run-meta { font-size: 11px; color: var(--text-dim); }
+  .run-body { display: none; padding: 12px 14px; max-height: 60vh; overflow-y: auto; }
+  .run-body.open { display: block; }
+  .run-summary { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+
+  /* Step rendering */
+  .step { margin-bottom: 10px; }
+  .step-header { font-size: 12px; font-weight: 600; color: var(--purple); margin-bottom: 4px;
+    padding: 4px 8px; background: rgba(188,140,255,0.06); border-radius: 4px; display: inline-block; }
+  .step-event { padding: 3px 0; font-size: 12px; font-family: monospace; }
+  .ev-text { color: var(--text); padding: 4px 8px; background: rgba(255,255,255,0.02);
+    border-radius: 4px; margin: 2px 0; white-space: pre-wrap; word-break: break-word;
+    max-height: 300px; overflow-y: auto; }
+  .ev-tool { padding: 4px 8px; background: rgba(88,166,255,0.04); border-left: 2px solid var(--accent);
+    margin: 2px 0; border-radius: 0 4px 4px 0; }
+  .ev-tool .tool-name { color: var(--accent); font-weight: 600; }
+  .ev-tool .tool-status { font-size: 10px; padding: 1px 6px; border-radius: 8px; margin-left: 6px; }
+  .ev-tool .tool-status.completed { background: rgba(63,185,80,0.15); color: var(--green); }
+  .ev-tool .tool-status.running { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .ev-tool .tool-status.error { background: rgba(248,81,73,0.15); color: var(--red); }
+  .ev-tool .tool-io { font-size: 11px; color: var(--text-dim); margin-top: 2px; word-break: break-all;
+    max-height: 200px; overflow-y: auto; }
+  .ev-tool .tool-io .io-label { color: var(--text-dim); font-weight: 600; }
+  .ev-tool .tool-io .io-val { color: #9ca3af; }
+  .step-finish { font-size: 11px; color: var(--text-dim); font-style: italic; margin-top: 2px; }
+  .ev-time { color: var(--text-dim); font-size: 10px; margin-right: 6px; }
+
+  #refresh-indicator { color: var(--text-dim); font-size: 12px; }
+  .copy-btn { cursor: pointer; color: var(--text-dim); font-size: 11px; margin-left: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.2);
+    border-top-color:var(--yellow); border-radius:50%; animation:spin 0.8s linear infinite;
+    vertical-align:middle; margin-right:4px; }
+  .analyze-queue-banner { background:rgba(210,153,34,0.1); border:1px solid rgba(210,153,34,0.3);
+    border-radius:6px; padding:10px 14px; margin-bottom:12px; font-size:12px; }
+  .analyze-queue-banner .aq-title { color:var(--yellow); font-weight:600; margin-bottom:6px; }
+  .analyze-queue-item { display:flex; align-items:center; gap:8px; padding:3px 0;
+    border-bottom:1px solid rgba(255,255,255,0.05); font-family:monospace; }
+  .analyze-queue-item:last-child { border-bottom:none; }
+  .prog-row { display:grid; grid-template-columns:2fr 80px 80px 1fr auto; gap:8px;
+    align-items:center; padding:8px; border-bottom:1px solid var(--border);
+    font-size:12px; }
+  .prog-row:last-child { border-bottom:none; }
+  .prog-status-waiting  { color:var(--text-dim); }
+  .prog-status-running  { color:var(--yellow); }
+  .prog-status-done     { color:var(--green); }
+  .prog-status-skipped  { color:var(--text-dim); font-style:italic; }
+  .prog-status-error    { color:var(--red); }
+  .prog-output { background:var(--bg); border:1px solid var(--border); border-radius:4px;
+    padding:8px; font-size:11px; font-family:monospace; white-space:pre-wrap;
+    max-height:180px; overflow-y:auto; margin-top:6px; color:var(--text-dim); }
+  .copy-btn:hover { color: var(--accent); }
+  .tab-bar { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 8px 16px; cursor: pointer; font-size: 13px; color: var(--text-dim);
+    border-bottom: 2px solid transparent; transition: all 0.15s; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  .modal-wide .tab-content.active { max-height: 65vh; overflow-y: auto; }
+  .dialog-msg { font-size: 13px; color: var(--text); white-space: pre-wrap; }
+  .modal-danger { border-color: rgba(248,81,73,0.45); box-shadow: 0 0 0 1px rgba(248,81,73,0.15) inset; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Multi-Agent TODO Resolver</h1>
+    <div>
+      <span id="refresh-indicator">Auto-refresh: 5s</span>
+      <button class="btn" onclick="refresh()">Refresh</button>
+    </div>
+  </header>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="actions">
+    <button class="btn btn-primary" onclick="showAddTask()">+ Submit Task</button>
+    <button class="btn" onclick="showTodosPanel()">&#9776; TODOs</button>
+    <button class="btn" onclick="dispatchAll()">Dispatch All</button>
+  </div>
+
+  <!-- Main view tabs -->
+  <div class="tab-bar" id="main-tab-bar">
+    <div class="tab active" onclick="switchMainTab(this,'main-tasks')">Tasks</div>
+    <div class="tab" onclick="switchMainTab(this,'main-todos')">Scanned TODOs <span id="todo-badge"></span></div>
+    <div class="tab" onclick="switchMainTab(this,'main-sysinfo')">System Info</div>
+  </div>
+
+  <!-- Tasks table -->
+  <div id="main-tasks">
+    <table class="task-table">
+      <thead>
+        <tr><th>ID</th><th>Title</th><th>Status</th><th>Priority</th><th>Source</th><th>Sessions</th><th>Updated</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="task-list"></tbody>
+    </table>
+  </div>
+
+  <!-- System Info panel -->
+  <div id="main-sysinfo" style="display:none">
+    <div id="sysinfo-content" style="padding:8px 0"><span style="color:var(--text-dim)">Loading...</span></div>
+  </div>
+
+  <!-- TODOs panel -->
+  <div id="main-todos" style="display:none">
+    <div class="actions" style="margin-bottom:12px">
+      <button class="btn btn-primary" onclick="showScanModal()">&#8635; Scan TODOs</button>
+      <button class="btn" onclick="analyzeSelected()">&#9881; Analyze Selected</button>
+      <button class="btn" style="color:var(--green)" onclick="dispatchSelected()">&#9654; Send to Planner</button>
+      <button class="btn" style="color:var(--yellow)" onclick="revertSelected()">&#8634; Revert to Analyzed</button>
+      <button class="btn" style="color:var(--red)" onclick="deleteSelected()">&#128465; Delete</button>
+      <button class="btn btn-sm" onclick="selectAllTodos()">Select All</button>
+      <button class="btn btn-sm" onclick="selectNoneTodos()">Select None</button>
+    </div>
+    <!-- Persistent analyze queue banner (shown when any item is ANALYZING) -->
+    <div id="analyze-queue-banner" class="analyze-queue-banner" style="display:none">
+      <div class="aq-title"><span class="spinner"></span>Analysis in progress</div>
+      <div id="analyze-queue-items"></div>
+    </div>
+    <table class="task-table" id="todo-table">
+      <thead>
+        <tr>
+          <th style="width:32px"><input type="checkbox" id="todo-check-all" onchange="toggleAllTodos(this)"></th>
+          <th>File</th>
+          <th>Description</th>
+          <th style="width:100px">Feasibility</th>
+          <th style="width:100px">Difficulty</th>
+          <th>Analysis Note</th>
+          <th style="width:100px">Status</th>
+          <th style="width:80px">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="todo-list"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Analyze Progress Modal -->
+<div class="modal-overlay" id="analyze-progress-modal">
+  <div class="modal modal-wide">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2 style="margin:0">&#9881; Analyze Progress</h2>
+      <button class="btn btn-sm" id="analyze-close-btn" onclick="closeAnalyzeModal()">Close</button>
+    </div>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+      Scores: <strong style="color:var(--green)">Feasibility</strong> = can/should it be done now (higher is better);
+      <strong style="color:var(--yellow)">Difficulty</strong> = how hard to implement (higher is harder).
+    </div>
+    <!-- Header row -->
+    <div class="prog-row" style="background:var(--surface);font-weight:600;color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.4px">
+      <div>TODO</div><div>Feasibility</div><div>Difficulty</div><div>Note</div><div>Status</div>
+    </div>
+    <div id="analyze-prog-list"></div>
+    <div id="analyze-prog-summary" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+</div>
+
+<!-- Scan TODOs Modal -->
+<div class="modal-overlay" id="scan-modal">
+  <div class="modal">
+    <h2>Scan TODOs</h2>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Scan a subdirectory for TODO/FIXME/HACK/XXX comments. Leave directory empty to scan the whole repository.</p>
+    <label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">Subdirectory (relative to repo root)</label>
+    <input id="scan-subdir" placeholder="e.g. be/src/olap  (empty = whole repo)" />
+    <label style="font-size:12px;color:var(--text-dim);display:block;margin:8px 0 4px">Max results</label>
+    <input id="scan-limit" type="number" min="0" placeholder="0 = no limit" value="100" style="width:120px" />
+    <div class="actions" style="margin-top:12px">
+      <button class="btn btn-primary" id="scan-submit-btn" onclick="doScanTodos()">Scan</button>
+      <button class="btn" onclick="closeModals()">Cancel</button>
+    </div>
+    <div id="scan-result" style="margin-top:10px;font-size:12px"></div>
+  </div>
+</div>
+
+<!-- Add Task Modal (tabbed: Develop / Review) -->
+<div class="modal-overlay" id="add-modal">
+  <div class="modal">
+    <h2>Submit Task</h2>
+    <div class="tab-bar" id="add-task-tabs">
+      <div class="tab active" onclick="switchAddTab(this, 'add-develop')">Develop</div>
+      <div class="tab" onclick="switchAddTab(this, 'add-review')">Review</div>
+    </div>
+
+    <!-- Develop tab -->
+    <div class="tab-content active" id="add-develop">
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">The Planner will analyze this and either implement it directly or break it into sub-tasks automatically.</p>
+      <input id="task-title" placeholder="Task title" />
+      <textarea id="task-desc" placeholder="Describe the task. Can be simple (one TODO) or complex (multi-module refactor)."></textarea>
+      <select id="task-priority">
+        <option value="high">High</option>
+        <option value="medium" selected>Medium</option>
+        <option value="low">Low</option>
+      </select>
+      <label style="font-size:12px;color:var(--text-dim);display:block;margin:8px 0 4px">Copy files to worktree <span style="font-size:11px">(one path per line, relative to repo root)</span></label>
+      <textarea id="task-copy-files" placeholder="e.g. test_data/input.csv&#10;debug/repro.sql" style="height:60px;font-family:monospace;font-size:12px"></textarea>
+      <div class="actions">
+        <button class="btn btn-primary" onclick="addTask()">Submit Develop Task</button>
+        <button class="btn" onclick="closeModals()">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Review tab -->
+    <div class="tab-content" id="add-review">
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Submit a patch, GitHub PR link, or code diff for review. Only reviewers will run (no coding agent).</p>
+      <input id="review-task-title" placeholder="Review title (optional)" />
+      <textarea id="review-task-input" placeholder="Paste a patch / diff, GitHub PR URL, or describe what to review..." style="height:160px;font-family:monospace;font-size:12px"></textarea>
+      <select id="review-task-priority">
+        <option value="high">High</option>
+        <option value="medium" selected>Medium</option>
+        <option value="low">Low</option>
+      </select>
+      <label style="font-size:12px;color:var(--text-dim);display:block;margin:8px 0 4px">Copy files to worktree <span style="font-size:11px">(one path per line, relative to repo root; e.g. patch files for reviewer to read)</span></label>
+      <textarea id="review-task-copy-files" placeholder="e.g. patches/fix.patch&#10;docs/design.md" style="height:60px;font-family:monospace;font-size:12px"></textarea>
+      <div class="actions">
+        <button class="btn btn-primary" onclick="addReviewTask()">Submit Review Task</button>
+        <button class="btn" onclick="closeModals()">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Task Detail Modal -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal modal-wide">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2 id="detail-title" style="margin:0">Task Detail</h2>
+      <button class="btn btn-sm" onclick="closeModals()">Close</button>
+    </div>
+    <div id="detail-content"></div>
+  </div>
+</div>
+
+<!-- Generic Alert / Confirm Modal -->
+<div class="modal-overlay" id="dialog-modal">
+  <div class="modal" id="dialog-box">
+    <h2 id="dialog-title">Notice</h2>
+    <div id="dialog-message" class="dialog-msg" style="margin-bottom:14px"></div>
+    <div class="actions" style="justify-content:flex-end; margin-bottom:0">
+      <button class="btn" id="dialog-cancel-btn" style="display:none">Cancel</button>
+      <button class="btn btn-primary" id="dialog-ok-btn">OK</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: {'Content-Type': 'application/json'}, ...opts
+  });
+  return res.json();
+}
+
+function fmtTime(ts) {
+  if (!ts) return '-';
+  return new Date(ts * 1000).toLocaleString();
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML.replace(/"/g, '&quot;');
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => {
+    // brief visual feedback could be added here
+  });
+}
+
+// Render a single session box
+function renderSessionBox(sessionId, label) {
+  if (!sessionId) return '';
+  const cmd = `opencode --session ${sessionId}`;
+  return `<div class="session-box">
+    <div class="session-label">${esc(label)}</div>
+    <code>${esc(sessionId)}</code>
+    <span class="copy-btn" onclick="copyText('${esc(cmd)}')" title="Copy command">[copy]</span>
+    <div class="cmd">${esc(cmd)}</div>
+  </div>`;
+}
+
+// Render all session info for a task
+function renderSessions(sessionIds) {
+  if (!sessionIds || !Object.keys(sessionIds).length) return '<span style="color:var(--text-dim)">-</span>';
+  let html = '';
+  for (const [agent, ids] of Object.entries(sessionIds)) {
+    if (Array.isArray(ids)) {
+      for (let i = 0; i < ids.length; i++) {
+        const label = ids.length > 1 ? `${agent} #${i+1}` : agent;
+        html += renderSessionBox(ids[i], label);
+      }
+    }
+  }
+  return html || '<span style="color:var(--text-dim)">-</span>';
+}
+
+// Count total sessions for the task list table
+function countSessions(sessionIds) {
+  if (!sessionIds) return 0;
+  let n = 0;
+  for (const ids of Object.values(sessionIds)) {
+    if (Array.isArray(ids)) n += ids.length;
+  }
+  return n;
+}
+
+// Render structured step events from a parsed run
+function renderParsedRun(parsed) {
+  if (!parsed || !parsed.steps || !parsed.steps.length) {
+    if (parsed && parsed.raw_fallback) {
+      return `<pre style="font-size:12px;color:var(--text-dim)">${esc(parsed.raw_fallback)}</pre>`;
+    }
+    return '<span style="color:var(--text-dim)">No events</span>';
+  }
+
+  let html = '';
+  const s = parsed.summary || {};
+  html += `<div class="run-summary">
+    <span>Steps: <b>${s.total_steps||0}</b></span>
+    <span>Text: <b>${s.text_segments||0}</b></span>
+    <span>Tool calls: <b>${s.tool_calls||0}</b></span>
+  </div>`;
+
+  for (const step of parsed.steps) {
+    html += `<div class="step">`;
+    html += `<div class="step-header">Step ${step.step_num}</div>`;
+    for (const ev of (step.events || [])) {
+      if (ev.type === 'text') {
+        html += `<div class="step-event"><span class="ev-time">${esc(ev.time)}</span><div class="ev-text">${esc(ev.content)}</div></div>`;
+      } else if (ev.type === 'tool') {
+        const statusCls = (ev.status === 'completed') ? 'completed' : (ev.status === 'error' ? 'error' : 'running');
+        html += `<div class="step-event"><span class="ev-time">${esc(ev.time)}</span><div class="ev-tool">`;
+        html += `<span class="tool-name">${esc(ev.tool)}</span>`;
+        html += `<span class="tool-status ${statusCls}">${esc(ev.status)}</span>`;
+        if (ev.input) {
+          html += `<div class="tool-io"><span class="io-label">in: </span><span class="io-val">${esc(ev.input)}</span></div>`;
+        }
+        if (ev.output) {
+          html += `<div class="tool-io"><span class="io-label">out: </span><span class="io-val">${esc(ev.output)}</span></div>`;
+        }
+        html += `</div></div>`;
+      }
+    }
+    if (step.finish_reason) {
+      html += `<div class="step-finish">-> ${esc(step.finish_reason)}</div>`;
+    }
+    html += `</div>`;
+  }
+  return html;
+}
+
+// Render git status for the worktree
+function renderGitStatus(gs, worktreePath, branchName, taskId) {
+  if (!gs || gs.error) {
+    const msg = (gs && gs.error) ? gs.error : 'No worktree assigned yet';
+    return `<span style="color:var(--text-dim)">${esc(msg)}</span>`;
+  }
+
+  const totalChanged = (gs.staged||[]).length + (gs.unstaged||[]).length + (gs.untracked||[]).length;
+  const cleanMsg = totalChanged === 0
+    ? `<span style="color:var(--green)">&#10003; Working tree clean</span>`
+    : '';
+
+  let html = `<div style="margin-bottom:12px">`;
+
+  // Header row
+  html += `<div style="display:flex;gap:16px;align-items:center;margin-bottom:10px;flex-wrap:wrap">`;
+  if (gs.branch) {
+    html += `<span style="background:rgba(188,140,255,0.1);color:var(--purple);padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600">&#9900; ${esc(gs.branch)}</span>`;
+  }
+  if (gs.ahead > 0) {
+    html += `<span style="color:var(--yellow);font-size:12px">&#8593; ${gs.ahead} ahead</span>`;
+  }
+  if (worktreePath) {
+    html += `<span style="color:var(--text-dim);font-size:11px;font-family:monospace">${esc(worktreePath)}</span>`;
+  }
+  html += `</div>`;
+
+  if (cleanMsg) {
+    html += `<div style="padding:8px 0;font-size:13px">${cleanMsg}</div>`;
+  }
+
+  // Staged files
+  if (gs.staged && gs.staged.length) {
+    html += `<div class="detail-section"><h3 style="color:var(--green)">Staged (${gs.staged.length})</h3>`;
+    html += `<div style="font-family:monospace;font-size:12px">`;
+    for (const f of gs.staged) {
+      html += `<div style="padding:2px 0;color:var(--green)">&#43; ${esc(f)}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Unstaged modified
+  if (gs.unstaged && gs.unstaged.length) {
+    html += `<div class="detail-section"><h3 style="color:var(--yellow)">Modified / Unstaged (${gs.unstaged.length})</h3>`;
+    html += `<div style="font-family:monospace;font-size:12px">`;
+    for (const f of gs.unstaged) {
+      html += `<div style="padding:2px 0;color:var(--yellow)">&#9998; ${esc(f)}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Untracked
+  if (gs.untracked && gs.untracked.length) {
+    html += `<div class="detail-section"><h3 style="color:var(--text-dim)">Untracked (${gs.untracked.length})</h3>`;
+    html += `<div style="font-family:monospace;font-size:12px">`;
+    for (const f of gs.untracked) {
+      html += `<div style="padding:2px 0;color:var(--text-dim)">? ${esc(f)}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Raw output (collapsible)
+  if (gs.raw && gs.raw.trim()) {
+    html += `<div class="detail-section">
+      <h3 style="cursor:pointer" onclick="this.nextElementSibling.classList.toggle('open');this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+        Raw git status &#9660;
+      </h3>
+      <pre style="display:none">${esc(gs.raw)}</pre>
+    </div>`;
+  }
+
+  // Command execution input
+  if (taskId && worktreePath) {
+    html += `<div class="detail-section" style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
+      <h3>Run Command</h3>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <input id="exec-cmd-input" type="text" placeholder="e.g. git log --oneline -10" value="git log --oneline -10"
+          style="flex:1;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:monospace;font-size:12px;margin:0"
+          onkeydown="if(event.key==='Enter')execWorktreeCmd('${taskId}')">
+        <button class="btn btn-sm" id="exec-cmd-btn" onclick="execWorktreeCmd('${taskId}')">Run</button>
+      </div>
+      <pre id="exec-cmd-output" style="background:var(--bg);padding:10px;border-radius:6px;font-size:11px;max-height:400px;overflow-y:auto;border:1px solid var(--border);display:none;white-space:pre-wrap"></pre>
+    </div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+let _lastRefreshHash = '';
+async function refresh() {
+  const [status, tasks] = await Promise.all([api('/api/status'), api('/api/tasks')]);
+  // Skip DOM rebuild if data unchanged (fast path for auto-refresh)
+  const hash = JSON.stringify([status.status_counts, tasks.map(t => [t.id, t.status, t.updated_at])]);
+  if (hash === _lastRefreshHash) return;
+  _lastRefreshHash = hash;
+
+  const sc = status.status_counts || {};
+  document.getElementById('stats').innerHTML = `
+    <div class="stat-card"><div class="num">${status.total_tasks||0}</div><div class="label">Total</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--text-dim)">${sc.pending||0}</div><div class="label">Pending</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--accent)">${(sc.planning||0)+(sc.coding||0)+(sc.reviewing||0)}</div><div class="label">Active</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--green)">${sc.completed||0}</div><div class="label">Completed</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--red)">${(sc.failed||0)+(sc.review_failed||0)}</div><div class="label">Failed</div></div>
+  `;
+
+  // Build parent-child tree: roots first, children indented below their parent
+  const byId = Object.fromEntries(tasks.map(t => [t.id, t]));
+  const childrenOf = {};
+  const roots = [];
+  for (const t of tasks) {
+    if (t.parent_id && byId[t.parent_id]) {
+      (childrenOf[t.parent_id] = childrenOf[t.parent_id] || []).push(t);
+    } else {
+      roots.push(t);
+    }
+  }
+  // Flatten into ordered list with depth info
+  const ordered = [];
+  function walk(list, depth) {
+    for (const t of list) {
+      ordered.push({t, depth});
+      if (childrenOf[t.id]) walk(childrenOf[t.id], depth + 1);
+    }
+  }
+  walk(roots, 0);
+
+  const tbody = document.getElementById('task-list');
+  tbody.innerHTML = ordered.map(({t, depth}) => {
+    const nSes = countSessions(t.session_ids);
+    const complexityBadge = t.complexity
+      ? `<span style="font-size:10px;margin-left:4px;color:${
+          t.complexity==='very_complex'?'var(--red)':
+          t.complexity==='complex'?'var(--yellow)':
+          t.complexity==='medium'?'var(--accent)':'var(--text-dim)'
+        };border:1px solid currentColor;padding:1px 4px;border-radius:3px">${t.complexity.replace('_',' ')}</span>`
+      : '';
+    const isPublished = t.published_at > 0;
+    const publishBtn = (t.status==='completed' && t.branch_name && t.task_mode !== 'review')
+      ? `<button class="btn btn-sm" style="color:var(--green)" onclick="publishTask('${t.id}')">${isPublished ? '&#8635; Re-push' : '&#8593; Publish'}</button>`
+      : '';
+    const indent = depth > 0 ? `padding-left:${depth * 24}px` : '';
+    const childIcon = depth > 0 ? '<span style="color:var(--text-dim);margin-right:4px">&#8627;</span>' : '';
+    const childCount = (childrenOf[t.id] || []).length;
+    const childBadge = childCount > 0
+      ? `<span style="font-size:10px;margin-left:6px;color:var(--text-dim);border:1px solid var(--border);padding:1px 5px;border-radius:3px">${childCount} sub</span>`
+      : '';
+    const modeBadge = t.task_mode === 'review'
+      ? '<span style="font-size:10px;margin-left:4px;color:var(--purple);border:1px solid var(--purple);padding:1px 4px;border-radius:3px">review</span>'
+      : '';
+    return `<tr style="${depth > 0 ? 'background:rgba(88,166,255,0.02)' : ''}">
+      <td><code style="font-size:${depth > 0 ? '10' : '12'}px">${t.id}</code></td>
+      <td style="cursor:pointer;color:var(--accent);${indent}" onclick="showDetail('${t.id}')">${childIcon}${esc(t.title)}${modeBadge}${complexityBadge}${childBadge}</td>
+      <td><span class="badge badge-${t.status}">${t.status}</span></td>
+      <td><span class="badge-${t.priority}">${t.priority}</span></td>
+      <td>${t.source}</td>
+      <td style="color:var(--text-dim)">${nSes > 0 ? nSes + ' session' + (nSes>1?'s':'') : '-'}</td>
+      <td>${fmtTime(t.updated_at)}</td>
+      <td style="white-space:nowrap">
+        ${t.status==='pending'?`<button class="btn btn-sm" onclick="dispatch('${t.id}')">Run</button>`:''}
+        ${publishBtn}
+        ${!['completed','cancelled'].includes(t.status)?`<button class="btn btn-sm" onclick="cancel('${t.id}')">Cancel</button>`:''}
+        ${['completed','failed','review_failed'].includes(t.status)&&t.branch_name?`<button class="btn btn-sm" style="color:var(--red)" onclick="cleanTask('${t.id}')">Clean</button>`:''}
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function showDetail(id) {
+  const data = await api(`/api/tasks/${id}`);
+  const t = data.task;
+  document.getElementById('detail-title').textContent = t.title;
+
+  // Tab bar
+  let html = `<div class="tab-bar">
+    <div class="tab active" onclick="switchTab(this, 'tab-overview')">Overview</div>
+    <div class="tab" onclick="switchTab(this, 'tab-sessions')">Sessions</div>
+    <div class="tab" onclick="switchTab(this, 'tab-runs')">Agent Runs (${(data.runs||[]).length})</div>
+    <div class="tab" onclick="switchTab(this, 'tab-gitstatus')">Git Status</div>
+    <div class="tab" onclick="switchTab(this, 'tab-output')">Outputs</div>
+  </div>`;
+
+  // ── Tab: Overview ──
+  html += `<div class="tab-content active" id="tab-overview">`;
+  const isPublished = t.published_at > 0;
+  const modeColor = t.task_mode === 'review' ? 'var(--purple)' : 'var(--accent)';
+  html += `<div class="detail-grid">
+    <div class="detail-card"><h4>Status</h4><div class="val"><span class="badge badge-${t.status}">${t.status}</span></div></div>
+    <div class="detail-card"><h4>Mode</h4><div class="val"><span style="color:${modeColor}">${t.task_mode||'develop'}</span></div></div>
+    <div class="detail-card"><h4>Complexity</h4><div class="val"><span style="color:${
+      t.complexity==='very_complex'?'var(--red)':
+      t.complexity==='complex'?'var(--yellow)':
+      t.complexity==='medium'?'var(--accent)':'var(--text-dim)'
+    }">${t.complexity||'-'}</span></div></div>
+    <div class="detail-card"><h4>Priority</h4><div class="val"><span class="badge-${t.priority}">${t.priority}</span></div></div>
+    <div class="detail-card"><h4>Source</h4><div class="val">${t.source}${t.parent_id ? ` <span style="font-size:11px;color:var(--text-dim)">(sub-task of <code style="cursor:pointer;color:var(--accent)" onclick="showDetail(this.dataset.id)" data-id="${t.parent_id}">${t.parent_id}</code>)</span>` : ''}</div></div>
+    <div class="detail-card"><h4>Retries</h4><div class="val">${t.retry_count} / ${t.max_retries}</div></div>
+    <div class="detail-card"><h4>Branch</h4><div class="val"><code style="font-size:11px">${esc(t.branch_name||'-')}</code></div></div>
+    <div class="detail-card"><h4>Worktree</h4><div class="val" style="font-size:11px">${esc(t.worktree_path||'-')}</div></div>
+    <div class="detail-card"><h4>File</h4><div class="val">${esc(t.file_path||'-')}${t.line_number ? ':'+t.line_number : ''}</div></div>
+    <div class="detail-card"><h4>Created</h4><div class="val">${fmtTime(t.created_at)}</div></div>
+    <div class="detail-card"><h4>Started</h4><div class="val">${fmtTime(t.started_at)}</div></div>
+    <div class="detail-card"><h4>Completed</h4><div class="val">${fmtTime(t.completed_at)}</div></div>
+    <div class="detail-card"><h4>Published</h4><div class="val">${isPublished ? fmtTime(t.published_at) : '-'}</div></div>
+  </div>`;
+  if (t.status === 'completed' && t.branch_name && t.task_mode !== 'review') {
+    html += `<div style="margin:12px 0">
+      ${isPublished ? `<span style="color:var(--green);margin-right:8px">&#10003; Published</span>` : ''}
+      <button class="btn" style="color:var(--green)" onclick="publishTask('${t.id}')">${isPublished ? '&#8635; Re-push to remote' : '&#8593; Publish branch to remote'}</button>
+    </div>`;
+  }
+  if (['completed','failed','review_failed'].includes(t.status) && t.branch_name) {
+    html += `<div style="margin:8px 0">
+      <button class="btn" style="color:var(--red);border-color:var(--red)" onclick="cleanTask('${t.id}')">&#128465; Clean up worktree &amp; branch</button>
+      <span style="font-size:11px;color:var(--text-dim);margin-left:8px">Frees disk/git resources. Cannot be undone.</span>
+    </div>`;
+  }
+  if (t.description) {
+    html += `<div class="detail-section"><h3>Description</h3><pre>${esc(t.description)}</pre></div>`;
+  }
+  if (t.review_input) {
+    html += `<div class="detail-section"><h3 style="color:var(--purple)">Review Input</h3><pre style="font-size:12px;max-height:300px;overflow:auto">${esc(t.review_input)}</pre></div>`;
+  }
+  if (t.error) {
+    html += `<div class="detail-section"><h3 style="color:var(--red)">Error</h3><pre style="color:var(--red)">${esc(t.error)}</pre></div>`;
+  }
+  // Revise section for completed/failed tasks with a worktree
+  if (['completed','failed','review_failed'].includes(t.status) && t.worktree_path) {
+    html += `<div class="detail-section" style="margin-top:16px;border:1px solid var(--border);border-radius:8px;padding:12px">
+      <h3 style="margin-top:0">Revise Task</h3>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Provide additional review feedback. The coder will receive this feedback and re-enter the code\u2192review loop with retries reset.</p>
+      <textarea id="revise-feedback-${t.id}" placeholder="Enter your review feedback / revision instructions..." style="width:100%;height:80px;font-size:13px;margin-bottom:8px"></textarea>
+      <button class="btn btn-primary" id="revise-btn-${t.id}" onclick="reviseTask('${t.id}')">Revise</button>
+    </div>`;
+  }
+  html += `</div>`;
+
+  // ── Tab: Sessions ──
+  html += `<div class="tab-content" id="tab-sessions">`;
+  html += renderSessions(t.session_ids);
+  // Also show per-run sessions
+  if (data.runs && data.runs.length) {
+    html += `<div class="detail-section" style="margin-top:12px"><h3>Per-Run Sessions</h3>`;
+    for (const r of data.runs) {
+      const sid = r.session_id || (r.parsed && r.parsed.session_id) || '';
+      if (sid) {
+        html += renderSessionBox(sid, `${r.agent_type} (${r.duration_sec.toFixed(1)}s)`);
+      }
+    }
+    html += `</div>`;
+  }
+  html += `</div>`;
+
+  // ── Tab: Agent Runs ──
+  html += `<div class="tab-content" id="tab-runs">`;
+  if (data.runs && data.runs.length) {
+    for (let i = 0; i < data.runs.length; i++) {
+      const r = data.runs[i];
+      const sid = r.session_id || (r.parsed && r.parsed.session_id) || '';
+      const exitColor = r.exit_code === 0 ? 'var(--green)' : 'var(--red)';
+      const failStyle = r.exit_code !== 0 ? 'border-left:3px solid var(--red)' : '';
+      html += `<div class="run-card" style="${failStyle}">
+        <div class="run-header" onclick="toggleRun(this)">
+          <div>
+            <span class="run-title" style="color:${
+              r.agent_type==='planner' ? 'var(--purple)' :
+              r.agent_type==='coder' ? 'var(--accent)' :
+              r.agent_type==='reviewer' ? 'var(--yellow)' :
+              r.agent_type==='manual_review' ? '#f0883e' : 'var(--text)'
+            }">${r.agent_type === 'manual_review' ? 'manual review' : r.agent_type}</span>
+            <span class="run-meta" style="margin-left:8px">${r.model}</span>
+            ${r.review_verdict ? `<span style="margin-left:8px;font-weight:bold;font-size:12px;padding:1px 8px;border-radius:3px;${
+              r.review_verdict==='approve'
+                ? 'color:var(--green);border:1px solid var(--green)'
+                : 'color:var(--red);border:1px solid var(--red)'
+            }">${r.review_verdict==='approve' ? 'APPROVE' : 'REQUEST_CHANGES'}</span>` : ''}
+          </div>
+          <div>
+            <span style="color:${exitColor};font-size:12px">exit=${r.exit_code}</span>
+            <span class="run-meta" style="margin-left:8px">${r.duration_sec.toFixed(1)}s</span>
+            ${sid ? `<span class="run-meta" style="margin-left:8px">session: ${sid.substring(0,20)}...</span>` : ''}
+          </div>
+        </div>
+        <div class="run-body" id="run-body-${i}">
+          ${sid ? renderSessionBox(sid, r.agent_type + ' session') : ''}
+          ${r.agent_type === 'manual_review'
+            ? `<pre style="font-size:12px;white-space:pre-wrap;word-break:break-word;color:var(--text)">${esc(r.output||'(no content)')}</pre>`
+            : renderParsedRun(r.parsed)}
+        </div>
+      </div>`;
+    }
+  } else {
+    html += '<span style="color:var(--text-dim)">No agent runs yet</span>';
+  }
+  html += `</div>`;
+
+  // ── Tab: Git Status ──
+  html += `<div class="tab-content" id="tab-gitstatus">`;
+  html += renderGitStatus(data.git_status, t.worktree_path, t.branch_name, t.id);
+  html += `</div>`;
+
+  // ── Tab: Outputs ──
+  html += `<div class="tab-content" id="tab-output">`;
+  html += `<div class="detail-section"><h3>Plan Output</h3><pre>${esc(t.plan_output||'-')}</pre></div>`;
+  html += `<div class="detail-section"><h3>Code Output</h3><pre>${esc(t.code_output||'-')}</pre></div>`;
+  // Per-reviewer results
+  if (t.reviewer_results && t.reviewer_results.length) {
+    html += `<div class="detail-section"><h3>Review Results (${t.reviewer_results.length} reviewer${t.reviewer_results.length>1?'s':''})</h3>`;
+    for (const rr of t.reviewer_results) {
+      const verdictColor = rr.passed ? 'var(--green)' : 'var(--red)';
+      const verdict = rr.passed ? 'APPROVE' : 'REQUEST_CHANGES';
+      html += `<div style="margin-bottom:16px;border:1px solid ${verdictColor};border-radius:6px;overflow:hidden">
+        <div style="background:rgba(0,0,0,0.3);padding:8px 12px;display:flex;align-items:center;gap:12px">
+          <span style="color:${verdictColor};font-weight:bold">${verdict}</span>
+          <span style="color:var(--text-dim);font-size:12px">${esc(rr.model)}</span>
+        </div>
+        <pre style="margin:0;padding:12px;border-radius:0;font-size:12px;max-height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-word">${esc(rr.output||'-')}</pre>
+      </div>`;
+    }
+    html += `</div>`;
+  } else {
+    html += `<div class="detail-section"><h3>Review Output</h3><pre>${esc(t.review_output||'-')}</pre></div>`;
+  }
+  html += `</div>`;
+
+  document.getElementById('detail-content').innerHTML = html;
+  document.getElementById('detail-modal').classList.add('active');
+}
+
+function switchTab(el, tabId) {
+  // Deactivate all tabs and content in this modal
+  el.parentElement.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  const container = el.parentElement.parentElement;
+  container.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  container.querySelector('#' + tabId).classList.add('active');
+}
+
+function toggleRun(header) {
+  const body = header.nextElementSibling;
+  body.classList.toggle('open');
+  // Scroll to top of run body when opening
+  if (body.classList.contains('open')) body.scrollTop = 0;
+}
+
+function showAddTask() { document.getElementById('add-modal').classList.add('active'); }
+function closeModals() { document.querySelectorAll('.modal-overlay').forEach(m=>m.classList.remove('active')); }
+
+function uiAlert(message, title = 'Notice') {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('dialog-modal');
+    const box = document.getElementById('dialog-box');
+    const titleEl = document.getElementById('dialog-title');
+    const msgEl = document.getElementById('dialog-message');
+    const okBtn = document.getElementById('dialog-ok-btn');
+    const cancelBtn = document.getElementById('dialog-cancel-btn');
+
+    box.classList.remove('modal-danger');
+    titleEl.textContent = title;
+    msgEl.textContent = String(message || '');
+    cancelBtn.style.display = 'none';
+
+    const cleanup = () => {
+      okBtn.onclick = null;
+      overlay.classList.remove('active');
+      resolve();
+    };
+    okBtn.onclick = cleanup;
+    overlay.classList.add('active');
+  });
+}
+
+function uiConfirm(message, title = 'Please Confirm') {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('dialog-modal');
+    const box = document.getElementById('dialog-box');
+    const titleEl = document.getElementById('dialog-title');
+    const msgEl = document.getElementById('dialog-message');
+    const okBtn = document.getElementById('dialog-ok-btn');
+    const cancelBtn = document.getElementById('dialog-cancel-btn');
+
+    box.classList.add('modal-danger');
+    titleEl.textContent = title;
+    msgEl.textContent = String(message || '');
+    cancelBtn.style.display = '';
+
+    const finish = (val) => {
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+      overlay.classList.remove('active');
+      resolve(val);
+    };
+    okBtn.onclick = () => finish(true);
+    cancelBtn.onclick = () => finish(false);
+    overlay.classList.add('active');
+  });
+}
+
+async function execWorktreeCmd(taskId) {
+  const input = document.getElementById('exec-cmd-input');
+  const btn = document.getElementById('exec-cmd-btn');
+  const output = document.getElementById('exec-cmd-output');
+  const cmd = input.value.trim();
+  if (!cmd) return;
+  btn.disabled = true; btn.textContent = 'Running...';
+  output.style.display = 'block';
+  output.textContent = '$ ' + cmd + '\\n...';
+  try {
+    const res = await api(`/api/tasks/${taskId}/exec`, {method:'POST', body: JSON.stringify({command: cmd})});
+    if (res.error) {
+      output.innerHTML = `<span style="color:var(--text-dim)">$ ${esc(cmd)}</span>\n<span style="color:var(--red)">${esc(res.error)}</span>`;
+    } else {
+      let text = `<span style="color:var(--text-dim)">$ ${esc(cmd)}</span>  <span style="color:${res.exit_code===0?'var(--green)':'var(--red)'}">exit=${res.exit_code}</span>\n`;
+      if (res.stdout) text += esc(res.stdout);
+      if (res.stderr) text += `<span style="color:var(--red)">${esc(res.stderr)}</span>`;
+      if (!res.stdout && !res.stderr) text += '<span style="color:var(--text-dim)">(no output)</span>';
+      output.innerHTML = text;
+    }
+  } catch(e) {
+    output.innerHTML = `<span style="color:var(--red)">Request failed: ${esc(String(e))}</span>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Run';
+  }
+}
+
+function initOverlayClose() {
+  const detail = document.getElementById('detail-modal');
+  if (detail) {
+    detail.addEventListener('click', (e) => {
+      if (e.target === detail) {
+        closeModals();
+      }
+    });
+  }
+}
+
+async function addTask() {
+  const title = document.getElementById('task-title').value.trim();
+  if (!title) return;
+  await api('/api/tasks', { method:'POST', body: JSON.stringify({
+    title,
+    description: document.getElementById('task-desc').value,
+    priority: document.getElementById('task-priority').value,
+    copy_files: document.getElementById('task-copy-files').value,
+  })});
+  closeModals(); refresh();
+}
+
+async function addReviewTask() {
+  const reviewInput = document.getElementById('review-task-input').value.trim();
+  if (!reviewInput) return;
+  await api('/api/tasks/review', { method:'POST', body: JSON.stringify({
+    title: document.getElementById('review-task-title').value.trim(),
+    review_input: reviewInput,
+    priority: document.getElementById('review-task-priority').value,
+    copy_files: document.getElementById('review-task-copy-files').value,
+  })});
+  closeModals(); refresh();
+}
+
+function switchAddTab(el, tabId) {
+  const modal = el.closest('.modal');
+  modal.querySelectorAll('#add-task-tabs .tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  modal.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  modal.querySelector('#' + tabId).classList.add('active');
+}
+
+async function dispatchAll() { await api('/api/dispatch-all', {method:'POST'}); refresh(); }
+async function dispatch(id) { await api(`/api/tasks/${id}/dispatch`, {method:'POST'}); refresh(); }
+async function cancel(id) { await api(`/api/tasks/${id}/cancel`, {method:'POST'}); refresh(); }
+
+async function cleanTask(id) {
+  const confirmed = await uiConfirm(
+    `Delete the git branch and worktree directory for task ${id.slice(0,8)}? The task record is kept. This cannot be undone.`,
+    'Clean up worktree & branch'
+  );
+  if (!confirmed) return;
+  const res = await api(`/api/tasks/${id}/clean`, {method:'POST'});
+  if (res && res.error) { await uiAlert(res.error, 'Clean failed'); return; }
+  await uiAlert(`Branch "${res.branch}" and its worktree have been removed.`, 'Cleaned');
+  refresh();
+}
+
+async function publishTask(id) {
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = 'Publishing...'; }
+  try {
+    const res = await api(`/api/tasks/${id}/publish`, {method:'POST'});
+    if (res.success) {
+      await uiAlert(`Branch "${res.branch}" pushed to remote "${res.remote}" successfully.\n\nYou can now open a PR from this branch.`, 'Publish Succeeded');
+      refresh();
+    } else {
+      await uiAlert(`Publish failed:\n${res.message || res.error}`, 'Publish Failed');
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '&#8593; Publish'; }
+  }
+}
+
+async function reviseTask(id) {
+  const textarea = document.getElementById('revise-feedback-' + id);
+  const feedback = textarea ? textarea.value.trim() : '';
+  if (!feedback) { await uiAlert('Please enter review feedback.'); return; }
+  const btn = document.getElementById('revise-btn-' + id);
+  if (btn) { btn.disabled = true; btn.textContent = 'Submitting...'; }
+  try {
+    const res = await api(`/api/tasks/${id}/revise`, {method:'POST', body: JSON.stringify({feedback})});
+    if (res.error) {
+      await uiAlert('Revise failed: ' + res.error);
+    } else {
+      closeModals(); refresh();
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Revise'; }
+  }
+}
+
+// ── Main tab switching ──
+function switchMainTab(el, panelId) {
+  document.getElementById('main-tab-bar').querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  ['main-tasks','main-todos','main-sysinfo'].forEach(id => {
+    document.getElementById(id).style.display = (id === panelId) ? '' : 'none';
+  });
+  if (panelId === 'main-todos') loadTodos();
+  if (panelId === 'main-sysinfo') loadSysInfo();
+}
+
+function showSysToast(msg, ok) {
+  const el = document.getElementById('sysinfo-toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = ok ? 'var(--green)' : 'var(--red)';
+  el.style.display = 'inline';
+  setTimeout(() => { el.style.display = 'none'; }, 3500);
+}
+
+function buildModelSelect(id, models, current, extraAttr) {
+  // Build <select> options; if current not in list, prepend it so it's always selectable
+  const all = models.includes(current) ? models : (current ? [current, ...models] : models);
+  let opts = all.map(m =>
+    `<option value="${esc(m)}"${m === current ? ' selected' : ''}>${esc(m)}</option>`
+  ).join('');
+  return `<select class="sys-select" id="${id}" ${extraAttr||''}>${opts}</select>`;
+}
+
+function addReviewerRow(models, value) {
+  const container = document.getElementById('sys-reviewer-list');
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:6px';
+  const all = (value && !models.includes(value)) ? [value, ...models] : models;
+  const opts = all.map(m =>
+    `<option value="${esc(m)}"${m === value ? ' selected' : ''}>${esc(m)}</option>`
+  ).join('');
+  row.innerHTML = `<select class="sys-select sys-reviewer-select" style="flex:1">${opts}</select>
+    <button class="btn btn-sm" style="color:var(--red);padding:2px 7px;flex-shrink:0" onclick="this.parentElement.remove()" title="Remove">&times;</button>`;
+  container.appendChild(row);
+}
+
+async function saveSysModels() {
+  const btn = document.getElementById('sys-save-btn');
+  btn.disabled = true; btn.textContent = 'Saving...';
+  try {
+    const cmap = {};
+    document.querySelectorAll('[data-complexity]').forEach(el => {
+      cmap[el.dataset.complexity] = el.value;
+    });
+    const reviewerModels = [];
+    document.querySelectorAll('.sys-reviewer-select').forEach(el => {
+      if (el.value) reviewerModels.push(el.value);
+    });
+    const payload = {
+      planner_model: document.getElementById('sys-planner-model').value,
+      coder_model_default: document.getElementById('sys-coder-default').value,
+      coder_model_by_complexity: cmap,
+      reviewer_models: reviewerModels,
+    };
+    const res = await api('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      showSysToast('✓ Models updated successfully', true);
+      // Reload from server to confirm stored values are in sync
+      loadSysInfo();
+    } else {
+      showSysToast('✗ Failed: ' + (res.error || 'unknown error'), false);
+      btn.disabled = false; btn.textContent = 'Save Model Changes';
+    }
+  } catch(e) {
+    showSysToast('✗ Error: ' + e.message, false);
+    btn.disabled = false; btn.textContent = 'Save Model Changes';
+  }
+}
+
+async function loadSysInfo() {
+  const content = document.getElementById('sysinfo-content');
+  content.innerHTML = `<span style="color:var(--text-dim);font-size:12px">Loading...</span>`;
+
+  // Fetch config (source of truth) and model list in parallel
+  const [cfg, modelsResp] = await Promise.all([
+    api('/api/config'),
+    api('/api/models'),
+  ]);
+
+  if (cfg.error) {
+    content.innerHTML = `<span style="color:var(--red)">${esc(cfg.error)}</span>`;
+    return;
+  }
+  const models = (modelsResp && modelsResp.models) ? modelsResp.models : [];
+
+  const complexityColors = {
+    very_complex: 'var(--red)', complex: 'var(--yellow)',
+    medium: 'var(--accent)', simple: 'var(--text-dim)'
+  };
+
+  let html = `<div class="detail-grid">`;
+  html += `<div class="detail-card" style="grid-column:span 2">
+    <h4>Repository</h4>
+    <div class="val" style="font-size:12px;word-break:break-all">${esc(cfg.repo_path)}</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">base branch: <code>${esc(cfg.base_branch)}</code></div>
+  </div>`;
+  html += `<div class="detail-card" style="grid-column:span 2">
+    <h4>Worktree Directory</h4>
+    <div class="val" style="font-size:12px;word-break:break-all">${esc(cfg.worktree_dir)}</div>
+  </div>`;
+  html += `<div class="detail-card">
+    <h4>Planner Model</h4>
+    ${buildModelSelect('sys-planner-model', models, cfg.planner_model)}
+  </div>`;
+  html += `<div class="detail-card">
+    <h4>Default Coder Model</h4>
+    ${buildModelSelect('sys-coder-default', models, cfg.coder_model_default)}
+  </div>`;
+  html += `</div>`;
+
+  html += `<div class="detail-section"><h3>Coder Model by Complexity</h3>`;
+  html += `<table style="width:100%;border-collapse:collapse">`;
+  for (const [level, model] of Object.entries(cfg.coder_model_by_complexity || {})) {
+    const color = complexityColors[level] || 'var(--text)';
+    html += `<tr>
+      <td style="padding:5px 12px 5px 0;font-size:12px;white-space:nowrap;width:1%">
+        <span style="color:${color};border:1px solid ${color};padding:1px 7px;border-radius:3px">${esc(level.replace('_',' '))}</span>
+      </td>
+      <td style="padding:5px 0">${buildModelSelect('', models, model, `data-complexity="${esc(level)}"`)}</td>
+    </tr>`;
+  }
+  html += `</table></div>`;
+
+  html += `<div class="detail-section"><h3>Reviewer Models <span style="font-size:11px;color:var(--text-dim)">(all must approve)</span></h3>`;
+  html += `<div id="sys-reviewer-list">`;
+  if (cfg.reviewer_models && cfg.reviewer_models.length) {
+    for (const m of cfg.reviewer_models) {
+      const all = models.includes(m) ? models : [m, ...models];
+      const opts = all.map(x =>
+        `<option value="${esc(x)}"${x === m ? ' selected' : ''}>${esc(x)}</option>`
+      ).join('');
+      html += `<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+        <select class="sys-select sys-reviewer-select" style="flex:1">${opts}</select>
+        <button class="btn btn-sm" style="color:var(--red);padding:2px 7px;flex-shrink:0" onclick="this.parentElement.remove()" title="Remove">&times;</button>
+      </div>`;
+    }
+  }
+  html += `</div>`;
+  // Store models list on a hidden element so addReviewerRow can access it
+  html += `<button class="btn btn-sm" style="margin-top:6px;color:var(--accent)"
+    onclick="addReviewerRow(_sysModels,'')">+ Add reviewer</button>`;
+  html += `</div>`;
+
+  html += `<div style="margin:16px 0;display:flex;align-items:center;gap:14px">
+    <button class="btn" id="sys-save-btn" onclick="saveSysModels()" style="color:var(--green);font-weight:600">Save Model Changes</button>
+    <span id="sysinfo-toast" style="display:none;font-size:12px;font-weight:bold"></span>
+  </div>`;
+
+  html += `<div class="detail-section"><h3>Worktree Hooks <span style="font-size:11px;color:var(--text-dim)">(run after worktree creation, in order)</span></h3>`;
+  if (cfg.worktree_hooks && cfg.worktree_hooks.length) {
+    html += `<ol style="margin:0;padding-left:20px">`;
+    for (const h of cfg.worktree_hooks) {
+      html += `<li style="font-family:monospace;font-size:12px;margin-bottom:4px">${esc(h)}</li>`;
+    }
+    html += `</ol>`;
+  } else {
+    html += `<span style="color:var(--text-dim);font-size:12px">No hooks configured</span>`;
+  }
+  html += `</div>`;
+
+  html += `<div class="detail-section"><h3>Publish Remote</h3>`;
+  html += `<code style="font-size:12px">${esc(cfg.publish_remote)}</code></div>`;
+
+  html += `<div class="detail-section"><h3>Execution</h3>`;
+  html += `<div style="font-size:12px;color:var(--text-dim)">Max retries per task: <code>${esc(String(cfg.max_retries ?? '-'))}</code></div></div>`;
+
+  content.innerHTML = html;
+  // Expose model list for the dynamic "Add reviewer" button
+  window._sysModels = models;
+}
+
+function showTodosPanel() {
+  const tab = document.querySelector('#main-tab-bar .tab:nth-child(2)');
+  switchMainTab(tab, 'main-todos');
+}
+
+// ── Score bar rendering ──
+// invertColor: if true, low score is green (e.g. difficulty: lower = better)
+function scoreBar(score, invertColor) {
+  if (score < 0) return '<span style="color:var(--text-dim)">-</span>';
+  const pct = Math.round(score * 10);
+  let color;
+  if (invertColor) {
+    color = score <= 3 ? 'var(--green)' : score <= 6 ? 'var(--yellow)' : 'var(--red)';
+  } else {
+    color = score >= 7 ? 'var(--green)' : score >= 4 ? 'var(--yellow)' : 'var(--red)';
+  }
+  return `<div style="display:flex;align-items:center;gap:6px">
+    <div style="flex:1;height:6px;background:rgba(255,255,255,0.1);border-radius:3px">
+      <div style="width:${pct}%;height:100%;background:${color};border-radius:3px"></div>
+    </div>
+    <span style="font-size:11px;color:${color};width:24px">${score.toFixed(1)}</span>
+  </div>`;
+}
+
+// ── Load and render TODOs ──
+async function loadTodos() {
+  const items = await api('/api/todos');
+  const tbody = document.getElementById('todo-list');
+  const badge = document.getElementById('todo-badge');
+  const active = items.filter(i => i.status !== 'deleted');
+  badge.textContent = active.length ? `(${active.length})` : '';
+
+  if (!active.length) {
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--text-dim);padding:32px">
+      No TODOs yet. Click "Scan TODOs" to scan the repository.
+    </td></tr>`;
+    updateQueueBanner(items);
+    return;
+  }
+
+  tbody.innerHTML = active.map(item => {
+    const isAnalyzing = item.status === 'analyzing';
+    const statusColor = {
+      pending_analysis: 'var(--text-dim)',
+      analyzing:        'var(--yellow)',
+      analyzed:         'var(--accent)',
+      dispatched:       'var(--green)',
+    }[item.status] || 'var(--text-dim)';
+    const statusLabel = isAnalyzing
+      ? `<span class="spinner"></span><span style="color:var(--yellow);font-size:11px">analyzing</span>`
+      : item.status === 'dispatched'
+        ? `<span style="color:var(--green);font-size:11px">&#10003; sent</span>`
+        : `<span style="font-size:11px;color:${statusColor}">${item.status.replace(/_/g,' ')}</span>`;
+    const relFile = item.file_path.split('/').slice(-3).join('/');
+    const canAnalyze = item.status === 'pending_analysis' || item.status === 'analyzed';
+    const analyzeBtn = isAnalyzing
+      ? `<button class="btn btn-sm" disabled style="color:var(--text-dim)"><span class="spinner"></span></button>`
+      : canAnalyze
+        ? `<button class="btn btn-sm" onclick="analyzeSingle('${item.id}')">Analyze</button>`
+        : '';
+    const disableCheck = isAnalyzing;
+    return `<tr id="todo-row-${item.id}">
+      <td><input type="checkbox" class="todo-check" data-id="${item.id}" ${disableCheck?'disabled':''}></td>
+      <td style="font-family:monospace;font-size:11px" title="${esc(item.file_path)}">${esc(relFile)}:${item.line_number}</td>
+      <td style="font-size:12px">${esc(item.description)}</td>
+      <td>${scoreBar(item.feasibility_score, false)}</td>
+      <td>${scoreBar(item.difficulty_score, true)}</td>
+      <td style="font-size:11px;color:var(--text-dim)">${esc(item.analysis_note)||'<span style="color:var(--text-dim)">-</span>'}</td>
+      <td>${statusLabel}</td>
+      <td>${analyzeBtn}</td>
+    </tr>`;
+  }).join('');
+
+  updateQueueBanner(items);
+}
+
+// ── Persistent queue banner (shown when any item is in ANALYZING state) ──
+function updateQueueBanner(items) {
+  const analyzing = items.filter(i => i.status === 'analyzing');
+  const banner = document.getElementById('analyze-queue-banner');
+  const list = document.getElementById('analyze-queue-items');
+  if (!analyzing.length) { banner.style.display = 'none'; return; }
+  banner.style.display = '';
+  list.innerHTML = analyzing.map(i => {
+    const relFile = i.file_path.split('/').slice(-3).join('/');
+    return `<div class="analyze-queue-item">
+      <span style="color:var(--text-dim);font-size:10px">[${i.id}]</span>
+      <span>${esc(relFile)}:${i.line_number}</span>
+      <span style="color:var(--text-dim)">—</span>
+      <span style="color:var(--text)">${esc(i.description.slice(0,60))}</span>
+    </div>`;
+  }).join('');
+}
+
+function showScanModal() {
+  document.getElementById('scan-result').textContent = '';
+  document.getElementById('scan-modal').classList.add('active');
+}
+
+async function doScanTodos() {
+  const btn = document.getElementById('scan-submit-btn');
+  const subdir = document.getElementById('scan-subdir').value.trim();
+  const limit = parseInt(document.getElementById('scan-limit').value, 10) || 0;
+  const resultEl = document.getElementById('scan-result');
+  btn.disabled = true; btn.textContent = 'Scanning...';
+  resultEl.textContent = '';
+  try {
+    const res = await api('/api/todos/scan', {method:'POST', body: JSON.stringify({subdir, limit})});
+    await loadTodos();
+    if (res.scanned === 0) {
+      resultEl.style.color = 'var(--text-dim)';
+      resultEl.textContent = 'No new TODOs found (duplicates skipped).';
+    } else {
+      resultEl.style.color = 'var(--green)';
+      resultEl.textContent = `Found ${res.scanned} new TODO item(s). Switch to the TODOs tab to review.`;
+    }
+  } catch(e) {
+    resultEl.style.color = 'var(--red)';
+    resultEl.textContent = 'Scan failed: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Scan';
+  }
+}
+
+function getCheckedTodoIds() {
+  return Array.from(document.querySelectorAll('.todo-check:checked')).map(cb => cb.dataset.id);
+}
+
+function selectAllTodos() {
+  document.querySelectorAll('.todo-check:not(:disabled)').forEach(cb => cb.checked = true);
+}
+function selectNoneTodos() {
+  document.querySelectorAll('.todo-check').forEach(cb => cb.checked = false);
+}
+function toggleAllTodos(master) {
+  document.querySelectorAll('.todo-check:not(:disabled)').forEach(cb => cb.checked = master.checked);
+}
+
+// ── Analyze single from row button ──
+async function analyzeSingle(todoId) {
+  await runAnalyzeModal([todoId]);
+}
+
+// ── Analyze selected (batch) ──
+async function analyzeSelected() {
+  const ids = getCheckedTodoIds();
+  if (!ids.length) { await uiAlert('Select at least one TODO to analyze.', 'Nothing Selected'); return; }
+  await runAnalyzeModal(ids);
+}
+
+// ── Core: open progress modal and run analysis for a list of todo IDs ──
+async function runAnalyzeModal(ids) {
+  // Fetch current items to get descriptions
+  const allItems = await api('/api/todos');
+  const byId = Object.fromEntries(allItems.map(i => [i.id, i]));
+
+  // Build initial modal rows (all waiting)
+  const progList = document.getElementById('analyze-prog-list');
+  const summary = document.getElementById('analyze-prog-summary');
+  summary.textContent = '';
+
+  function makeRow(id, status, feasibility, difficulty, note, output) {
+    const item = byId[id] || {};
+    const relFile = (item.file_path || '').split('/').slice(-2).join('/');
+    const desc = esc((item.description || id).slice(0, 60));
+    const statusClass = `prog-status-${status}`;
+    const statusIcon = {
+      waiting: '&#8230;',
+      running: '<span class="spinner"></span>',
+      done: '&#10003;',
+      skipped: '&#10227;',
+      error: '&#10007;',
+    }[status] || '';
+    const feasHtml = feasibility >= 0 ? scoreBar(feasibility, false) : '<span style="color:var(--text-dim)">-</span>';
+    const diffHtml = difficulty >= 0 ? scoreBar(difficulty, true) : '<span style="color:var(--text-dim)">-</span>';
+    const noteHtml = note ? `<span title="${esc(note)}">${esc(note.slice(0,80))}</span>` : '<span style="color:var(--text-dim)">-</span>';
+    const outputToggle = output
+      ? `<button class="btn btn-sm" style="font-size:10px;padding:2px 6px" onclick="toggleOutput('out-${id}')">&#8897; Output</button>
+         <div id="out-${id}" class="prog-output" style="display:none;grid-column:span 5">${esc(output)}</div>`
+      : '';
+    return `<div class="prog-row" id="prow-${id}">
+      <div style="overflow:hidden">
+        <div style="font-family:monospace;font-size:11px;color:var(--text-dim)">${esc(relFile)}</div>
+        <div>${desc}</div>
+      </div>
+      <div>${feasHtml}</div>
+      <div>${diffHtml}</div>
+      <div style="font-size:11px">${noteHtml}</div>
+      <div class="${statusClass}">${statusIcon} ${status}</div>
+    </div>${outputToggle ? '<div style="padding:0 8px 8px;grid-column:span 5">' + outputToggle + '</div>' : ''}`;
+  }
+
+  progList.innerHTML = ids.map(id => makeRow(id, 'waiting', -1, -1, '', '')).join('');
+
+  document.getElementById('analyze-progress-modal').classList.add('active');
+
+  let doneCount = 0, errorCount = 0, skippedCount = 0;
+
+  for (const id of ids) {
+    // Update row to "running"
+    const row = document.getElementById(`prow-${id}`);
+    if (row) row.outerHTML = makeRow(id, 'running', -1, -1, '', '');
+
+    let result;
+    try {
+      const resp = await fetch(`/api/todos/${id}/analyze`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+      });
+      result = await resp.json();
+      if (!resp.ok) {
+        const errMsg = result.error || `HTTP ${resp.status}`;
+        if (resp.status === 409) {
+          const newRow = document.getElementById(`prow-${id}`);
+          if (newRow) newRow.outerHTML = makeRow(id, 'skipped', -1, -1, errMsg, '');
+          skippedCount++;
+        } else {
+          const newRow = document.getElementById(`prow-${id}`);
+          if (newRow) newRow.outerHTML = makeRow(id, 'error', -1, -1, errMsg, '');
+          errorCount++;
+        }
+        continue;
+      }
+    } catch(e) {
+      const newRow = document.getElementById(`prow-${id}`);
+      if (newRow) newRow.outerHTML = makeRow(id, 'error', -1, -1, String(e), '');
+      errorCount++;
+      continue;
+    }
+
+    // Update byId with fresh data
+    byId[id] = result;
+    const newRow = document.getElementById(`prow-${id}`);
+    if (newRow) newRow.outerHTML = makeRow(
+      id, 'done',
+      result.feasibility_score ?? -1,
+      result.difficulty_score ?? -1,
+      result.analysis_note || '',
+      result.analyze_output || '',
+    );
+    doneCount++;
+  }
+
+  summary.innerHTML = `Done: <span style="color:var(--green)">${doneCount}</span>` +
+    (skippedCount ? `&nbsp; Skipped (already running): <span style="color:var(--text-dim)">${skippedCount}</span>` : '') +
+    (errorCount ? `&nbsp; Errors: <span style="color:var(--red)">${errorCount}</span>` : '');
+
+  await loadTodos();
+}
+
+function toggleOutput(elemId) {
+  const el = document.getElementById(elemId);
+  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function closeAnalyzeModal() {
+  document.getElementById('analyze-progress-modal').classList.remove('active');
+}
+
+async function dispatchSelected() {
+  const ids = getCheckedTodoIds();
+  if (!ids.length) { await uiAlert('Select at least one TODO to send to the planner.', 'Nothing Selected'); return; }
+  const res = await api('/api/todos/dispatch', {method:'POST', body: JSON.stringify({ids})});
+  await loadTodos();
+  refresh();
+  await uiAlert(`Sent ${res.dispatched} task(s) to planner.`, 'Dispatch Complete');
+}
+
+async function revertSelected() {
+  const ids = getCheckedTodoIds();
+  if (!ids.length) { await uiAlert('Select at least one dispatched TODO to revert.', 'Nothing Selected'); return; }
+  const res = await api('/api/todos/revert', {method:'POST', body: JSON.stringify({ids})});
+  await loadTodos();
+  await uiAlert(`Reverted ${res.reverted} TODO item(s) back to analyzed.`, 'Revert Complete');
+}
+
+async function deleteSelected() {
+  const ids = getCheckedTodoIds();
+  if (!ids.length) { await uiAlert('Select at least one TODO to delete.', 'Nothing Selected'); return; }
+  if (!await uiConfirm(`Delete ${ids.length} TODO item(s)?`, 'Confirm Deletion')) return;
+  await api('/api/todos/delete', {method:'POST', body: JSON.stringify({ids})});
+  await loadTodos();
+}
+
+initOverlayClose();
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>"""
