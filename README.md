@@ -1,6 +1,6 @@
 # Multi-Agent TODO Resolver
 
-A persistent, daemon-based multi-agent system that leverages [opencode](https://github.com/nicepkg/opencode) to **automatically discover, plan, implement, and review code changes** across a codebase. Multiple tasks run in parallel, each in its own `git worktree`, driven by a **Planner → Coder → Reviewer** pipeline with configurable models and retry logic.
+A persistent, daemon-based multi-agent system that leverages [opencode](https://opencode.ai) to **automatically discover, plan, implement, and review code changes** across a codebase. Multiple tasks run in parallel, each in its own `git worktree`, driven by a **Planner → Coder → Reviewer** pipeline with configurable models and retry logic.
 
 ## Key Features
 
@@ -66,11 +66,11 @@ TODOs are scanned from the repo, then analyzed by an AI model that scores **feas
 User submits task / TODO dispatched
         │
         ▼
-   ┌─────────┐   Assesses complexity, may split into sub-tasks
-   │ PLANNING │──────────────────────────────────────────────┐
-   └────┬────┘                                               │
-        │                                           sub-tasks dispatched
-        ▼                                           independently
+   ┌─────────┐  Assesses complexity, may split into sub-tasks
+   │ PLANNING│──────────────────────────────────────────────┐
+   └────┬────┘                                              │
+        │                                          sub-tasks dispatched
+        ▼                                          independently
    git worktree created (agent/task-<id>-<slug>)
         │
         ▼  ◄─── retry loop (up to max_retries) ───┐
@@ -97,7 +97,7 @@ Completed tasks can be **published** (push branch to remote), **revised** (human
 ### Prerequisites
 
 - Python 3.11+
-- [opencode](https://github.com/nicepkg/opencode) CLI installed and configured with at least one model provider
+- [opencode](https://opencode.ai) CLI installed and configured with at least one model provider
 - A git repository to work on
 
 ### Setup

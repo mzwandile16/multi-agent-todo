@@ -934,6 +934,7 @@ async function refresh() {
 
   // Build parent-child tree: roots first, children indented below their parent
   const byId = Object.fromEntries(tasks.map(t => [t.id, t]));
+  window._taskById = byId;  // expose for detail view dep lookup
   const childrenOf = {};
   const roots = [];
   for (const t of tasks) {
@@ -976,16 +977,27 @@ async function refresh() {
     const modeBadge = t.task_mode === 'review'
       ? '<span style="font-size:10px;margin-left:4px;color:var(--purple);border:1px solid var(--purple);padding:1px 4px;border-radius:3px">review</span>'
       : '';
+    const deps = t.depends_on || [];
+    // "blocked" badge: pending task with unresolved deps (at least one dep not completed)
+    const isBlocked = t.status === 'pending' && deps.length > 0 && deps.some(depId => {
+      const dep = byId[depId]; return !dep || dep.status !== 'completed';
+    });
+    const blockedBadge = isBlocked
+      ? `<span title="Waiting for: ${deps.map(d=>d).join(', ')}" style="font-size:10px;margin-left:5px;color:var(--yellow);border:1px solid var(--yellow);padding:1px 5px;border-radius:3px">&#9203; blocked</span>`
+      : '';
+    const depsBadge = !isBlocked && deps.length > 0
+      ? `<span style="font-size:10px;margin-left:5px;color:var(--text-dim);border:1px solid var(--border);padding:1px 5px;border-radius:3px">after ${deps.length}</span>`
+      : '';
     return `<tr style="${depth > 0 ? 'background:rgba(88,166,255,0.02)' : ''}">
       <td><code style="font-size:${depth > 0 ? '10' : '12'}px">${t.id}</code></td>
-      <td style="cursor:pointer;color:var(--accent);${indent}" onclick="showDetail('${t.id}')">${childIcon}${esc(t.title)}${modeBadge}${complexityBadge}${childBadge}</td>
+      <td style="cursor:pointer;color:var(--accent);${indent}" onclick="showDetail('${t.id}')">${childIcon}${esc(t.title)}${modeBadge}${complexityBadge}${childBadge}${blockedBadge}${depsBadge}</td>
       <td><span class="badge badge-${t.status}">${t.status}</span></td>
       <td><span class="badge-${t.priority}">${t.priority}</span></td>
       <td>${t.source}</td>
       <td style="color:var(--text-dim)">${nSes > 0 ? nSes + ' session' + (nSes>1?'s':'') : '-'}</td>
       <td>${fmtTime(t.updated_at)}</td>
       <td style="white-space:nowrap">
-        ${t.status==='pending'?`<button class="btn btn-sm" onclick="dispatch('${t.id}')">Run</button>`:''}
+        ${t.status==='pending'&&!isBlocked?`<button class="btn btn-sm" onclick="dispatch('${t.id}')">Run</button>`:''}
         ${publishBtn}
         ${!['completed','cancelled'].includes(t.status)?`<button class="btn btn-sm" onclick="cancel('${t.id}')">Cancel</button>`:''}
         ${['completed','failed','review_failed'].includes(t.status)&&t.branch_name?`<button class="btn btn-sm" style="color:var(--red)" onclick="cleanTask('${t.id}')">Clean</button>`:''}
@@ -1023,6 +1035,12 @@ async function showDetail(id) {
     <div class="detail-card"><h4>Priority</h4><div class="val"><span class="badge-${t.priority}">${t.priority}</span></div></div>
     <div class="detail-card"><h4>Source</h4><div class="val">${t.source}${t.parent_id ? ` <span style="font-size:11px;color:var(--text-dim)">(sub-task of <code style="cursor:pointer;color:var(--accent)" onclick="showDetail(this.dataset.id)" data-id="${t.parent_id}">${t.parent_id}</code>)</span>` : ''}</div></div>
     <div class="detail-card"><h4>Retries</h4><div class="val">${t.retry_count} / ${t.max_retries}</div></div>
+    ${(t.depends_on && t.depends_on.length) ? `<div class="detail-card" style="grid-column:1/-1"><h4>Depends On</h4><div class="val" style="display:flex;flex-wrap:wrap;gap:6px">${t.depends_on.map(depId => {
+      const dep = (window._taskById||{})[depId];
+      const depStatus = dep ? dep.status : '?';
+      const statusColor = depStatus==='completed'?'var(--green)':depStatus==='failed'?'var(--red)':depStatus==='pending'?'var(--yellow)':'var(--accent)';
+      return `<span style="font-size:12px"><code style="cursor:pointer;color:var(--accent)" onclick="showDetail('${depId}')">${depId}</code> <span class="badge badge-${depStatus}" style="font-size:10px">${depStatus}</span></span>`;
+    }).join('')}</div></div>` : ''}
     <div class="detail-card"><h4>Branch</h4><div class="val"><code style="font-size:11px">${esc(t.branch_name||'-')}</code></div></div>
     <div class="detail-card"><h4>Worktree</h4><div class="val" style="font-size:11px">${esc(t.worktree_path||'-')}</div></div>
     <div class="detail-card"><h4>File</h4><div class="val">${esc(t.file_path||'-')}${t.line_number ? ':'+t.line_number : ''}</div></div>

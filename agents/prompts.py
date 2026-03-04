@@ -85,7 +85,7 @@ def planner_analyze_and_split(title: str, description: str, repo_path: str) -> s
       split        bool  whether to decompose into sub-tasks
       reason       str   one-sentence justification for both decisions
       plan         str   (only when split=false) numbered implementation steps
-      sub_tasks    list  (only when split=true) [{title, description, priority}, ...]
+      sub_tasks    list  (only when split=true) [{title, description, priority, depends_on}, ...]
     """
     return f"""You are a planning agent. Analyze the following task and produce a structured plan.
 
@@ -100,20 +100,26 @@ Step 1 — Assess complexity. Choose ONE label:
   medium       : Clear scope, a few files, straightforward logic.
   simple       : Trivial fix or one-liner, low risk, small model is sufficient.
 
-Step 2 — Decide splitting. Split into independent parallel sub-tasks ONLY if:
-  - The task clearly contains multiple independent concerns in different modules/files AND
-  - Parallelising would save meaningful time.
+Step 2 — Decide splitting. Split into sub-tasks ONLY if:
+  - The task clearly contains multiple separable concerns in different modules/files AND
+  - Parallelising (where possible) would save meaningful time.
   Prefer NOT splitting. Touching 2-3 related files should NOT be split. Max 6 sub-tasks.
-  Sub-tasks must be fully independent (no ordering dependency between them).
 
-Step 3 — Produce the output. Output ONLY valid JSON (no markdown fences).
+Step 3 — For each sub-task, determine ordering dependencies:
+  - Sub-tasks that can run in parallel have an empty depends_on list.
+  - If sub-task B must wait for sub-task A to complete first, add A's 0-based index to B's depends_on.
+  - Only add a dependency when there is a real reason (e.g. B modifies an interface that A defines).
+  - Prefer parallelism: only add dependencies that are strictly required.
+
+Step 4 — Produce the output. Output ONLY valid JSON (no markdown fences).
 
 If single task:
 {{"complexity": "medium", "split": false, "reason": "...", "plan": "Overall objective: ...\\n1. ...\\n2. ..."}}
 
 If split:
 {{"complexity": "complex", "split": true, "reason": "...", "sub_tasks": [
-  {{"title": "Fix X", "description": "Modify file Y to ...", "priority": "medium"}}
+  {{"title": "Define new interface in module A", "description": "...", "priority": "high", "depends_on": []}},
+  {{"title": "Migrate callers to new interface", "description": "...", "priority": "medium", "depends_on": [0, 2, 3]}}
 ]}}"""
 
 

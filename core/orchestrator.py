@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from agents.coder import CoderAgent
 from agents.planner import PlannerAgent
@@ -66,6 +66,14 @@ class Orchestrator:
             "Orchestrator initialized: max_parallel=%d, repo=%s",
             max_parallel, config["repo"]["path"],
         )
+
+        # ── Dependency tracking (in-memory, rebuilt on sub-task creation) ──
+        # _pending_deps[task_id] = set of dep IDs that task is still waiting on
+        # _reverse_deps[dep_id] = set of task IDs that are waiting on dep_id
+        # _children_of[parent_id] = set of child task IDs
+        self._pending_deps: Dict[str, Set[str]] = {}
+        self._reverse_deps: Dict[str, Set[str]] = {}
+        self._children_of: Dict[str, Set[str]] = {}
 
         # Recovery: reset any TodoItems stuck in ANALYZING from a previous crash.
         # (from_dict already converts ANALYZING → PENDING_ANALYSIS on load, but items
@@ -342,6 +350,8 @@ class Orchestrator:
                 self.worktree_mgr.remove_worktree(task.branch_name)
             except Exception as e:
                 log.warning("Failed to remove worktree for %s: %s", task_id, e)
+        # Clean dependency tracking maps
+        self._cleanup_dep_maps(task_id)
         # Revert any TODO item linked to this task back to analyzed
         todos = self.db.get_all_todo_items()
         for item in todos:
@@ -948,16 +958,53 @@ class Orchestrator:
                     f"Split into {len(sub_tasks)} sub-tasks:\n"
                     + "\n".join(f"- {st.get('title','')}" for st in sub_tasks)
                 )
+                # Pass 1: create all child Task objects (IDs assigned at creation)
+                children: List[Task] = []
                 for st in sub_tasks:
-                    child = self.submit_task(
+                    child = Task(
                         title=st.get("title", "Sub-task"),
                         description=st.get("description", ""),
-                        priority=st.get("priority", "medium"),
+                        priority=TaskPriority(st.get("priority", "medium")),
+                        source=TaskSource.PLANNER,
                         parent_id=task.id,
+                        max_retries=int(self.config.get("orchestrator", {}).get("max_retries", 4)),
                     )
-                    child.source = TaskSource.PLANNER
+                    children.append(child)
+                # Pass 2: resolve depends_on indices → real IDs, persist, populate maps
+                child_ids = set()
+                for idx, (child, st) in enumerate(zip(children, sub_tasks)):
+                    raw_deps = st.get("depends_on", [])
+                    resolved: List[str] = []
+                    for dep_idx in raw_deps:
+                        if isinstance(dep_idx, int) and 0 <= dep_idx < len(children) and dep_idx != idx:
+                            resolved.append(children[dep_idx].id)
+                        else:
+                            log.warning(
+                                "Task [%s] sub-task %d has invalid depends_on entry %r — skipped",
+                                task.id, idx, dep_idx,
+                            )
+                    child.depends_on = resolved
                     self.db.save_task(child)
-                    # submit_task already dispatches; no extra call needed
+                    child_ids.add(child.id)
+                    # Populate in-memory maps
+                    if resolved:
+                        self._pending_deps[child.id] = set(resolved)
+                        for dep_id in resolved:
+                            self._reverse_deps.setdefault(dep_id, set()).add(child.id)
+                    log.info(
+                        "Created sub-task [%s] '%s' depends_on=%s",
+                        child.id, child.title, resolved,
+                    )
+                self._children_of[task.id] = child_ids
+                # Pass 3: dispatch unblocked sub-tasks
+                for child in children:
+                    if child.id not in self._pending_deps:
+                        self.dispatch_task(child.id)
+                    else:
+                        log.info(
+                            "Sub-task [%s] '%s' blocked by deps=%s, waiting",
+                            child.id, child.title, child.depends_on,
+                        )
                 task.status = TaskStatus.PLANNING  # will be updated when sub-tasks finish
                 task.updated_at = time.time()
                 self.db.save_task(task)
@@ -1118,8 +1165,35 @@ class Orchestrator:
             with self._lock:
                 self._futures.pop(task_id, None)
 
+    def _cleanup_dep_maps(self, task_id: str):
+        """Remove task_id from all dependency maps (called on cancel/fail)."""
+        # Remove as a waiter
+        removed_deps = self._pending_deps.pop(task_id, set())
+        for dep_id in removed_deps:
+            rev = self._reverse_deps.get(dep_id)
+            if rev:
+                rev.discard(task_id)
+                if not rev:
+                    del self._reverse_deps[dep_id]
+        # Remove as a dependency (don't auto-dispatch — cancelled dep means
+        # dependents stay blocked; parent will be marked failed/cancelled)
+        self._reverse_deps.pop(task_id, None)
+
+    def _unblock_dependents(self, completed_task_id: str):
+        """Remove completed_task_id from every dependent's pending set.
+        Dispatch any dependent whose pending set becomes empty."""
+        waiting = self._reverse_deps.pop(completed_task_id, set())
+        for dep_task_id in waiting:
+            pending = self._pending_deps[dep_task_id]
+            pending.discard(completed_task_id)
+            if not pending:
+                del self._pending_deps[dep_task_id]
+                log.info("Unblocking sub-task [%s] — all deps satisfied", dep_task_id)
+                self.dispatch_task(dep_task_id)
+
     def _update_parent_status(self, task_id: str):
-        """If task has a parent, check all siblings and update parent status.
+        """If task has a parent, unblock dependents and check whether all
+        children have reached a terminal state to update the parent.
 
         - All children completed → parent COMPLETED
         - Any child failed → parent FAILED
@@ -1129,14 +1203,20 @@ class Orchestrator:
         task = self.db.get_task(task_id)
         if not task or not task.parent_id:
             return
-        parent = self.db.get_task(task.parent_id)
-        if not parent:
+        if task.status == TaskStatus.COMPLETED:
+            self._unblock_dependents(task_id)
+        parent_id = task.parent_id
+        child_ids = self._children_of.get(parent_id)
+        if not child_ids:
             return
-        siblings = [t for t in self.db.get_all_tasks() if t.parent_id == task.parent_id]
-        statuses = {t.status for t in siblings}
+        statuses = set()
+        for cid in child_ids:
+            child = self.db.get_task(cid)
+            statuses.add(child.status)
         terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
         if not statuses.issubset(terminal):
             return  # still running
+        parent = self.db.get_task(parent_id)
         if TaskStatus.FAILED in statuses:
             parent.status = TaskStatus.FAILED
             parent.error = "One or more sub-tasks failed"
@@ -1151,7 +1231,14 @@ class Orchestrator:
                  parent.id, parent.status.value)
 
     def dispatch_task(self, task_id: str) -> bool:
-        """Submit a single task for execution."""
+        """Submit a single task for execution.
+
+        Returns False (without dispatching) if the task has unmet dependencies.
+        """
+        if task_id in self._pending_deps:
+            log.info("Task [%s] has unmet deps %s — not dispatching yet",
+                     task_id, self._pending_deps[task_id])
+            return False
         with self._lock:
             if task_id in self._futures:
                 log.warning("Task already running: %s", task_id)

@@ -82,6 +82,9 @@ class Task:
     # Parent task (for sub-tasks created by planner)
     parent_id: Optional[str] = None
 
+    # IDs of sibling tasks that must complete before this task can start
+    depends_on: List[str] = field(default_factory=list)
+
     # Session IDs per agent phase: {"planner": "ses_xxx", "coder": ["ses_xxx", ...], "reviewer": ["ses_xxx", ...]}
     session_ids: Dict[str, list] = field(default_factory=dict)
 
@@ -117,6 +120,7 @@ class Task:
         d.setdefault("task_mode", "develop")
         d.setdefault("review_input", "")
         d.setdefault("user_feedback", "")
+        d.setdefault("depends_on", [])
         return cls(**d)
 
 
