@@ -13,7 +13,8 @@ from agents.coder import CoderAgent
 from agents.planner import PlannerAgent
 from agents.reviewer import ReviewerAgent
 from core.database import Database
-from core.models import AgentRun, Task, TaskPriority, TaskSource, TaskStatus, TodoItem, TodoItemStatus
+from core.dep_tracker import DependencyTracker
+from core.models import AgentRun, ModelOutputError, Task, TaskPriority, TaskSource, TaskStatus, TodoItem, TodoItemStatus
 from core.opencode_client import OpenCodeClient
 from core.worktree import WorktreeManager
 
@@ -67,13 +68,8 @@ class Orchestrator:
             max_parallel, config["repo"]["path"],
         )
 
-        # ── Dependency tracking (in-memory, rebuilt on sub-task creation) ──
-        # _pending_deps[task_id] = set of dep IDs that task is still waiting on
-        # _reverse_deps[dep_id] = set of task IDs that are waiting on dep_id
-        # _children_of[parent_id] = set of child task IDs
-        self._pending_deps: Dict[str, Set[str]] = {}
-        self._reverse_deps: Dict[str, Set[str]] = {}
-        self._children_of: Dict[str, Set[str]] = {}
+        # Dependency tracking between sub-tasks (pure in-memory, rebuilt on split)
+        self.dep_tracker = DependencyTracker()
 
         # Recovery: reset any TodoItems stuck in ANALYZING from a previous crash.
         # (from_dict already converts ANALYZING → PENDING_ANALYSIS on load, but items
@@ -351,7 +347,7 @@ class Orchestrator:
             except Exception as e:
                 log.warning("Failed to remove worktree for %s: %s", task_id, e)
         # Clean dependency tracking maps
-        self._cleanup_dep_maps(task_id)
+        self.dep_tracker.cleanup(task_id)
         # Revert any TODO item linked to this task back to analyzed
         todos = self.db.get_all_todo_items()
         for item in todos:
@@ -821,7 +817,9 @@ class Orchestrator:
 
         repo_path = self.config["repo"]["path"]
         try:
-            run, feasibility, difficulty, note = self.planner.analyze_todo(item, repo_path)
+            run, feasibility, difficulty, note = self._analyze_todo_with_retry(
+                item, repo_path,
+            )
         except Exception as e:
             log.error(
                 "analyze_todo_item: analysis failed for todo [%s]: %s",
@@ -923,6 +921,58 @@ class Orchestrator:
 
     # ── Task Execution Pipeline ──────────────────────────────────────
 
+    def _plan_with_retry(self, task: Task, repo_path: str):
+        """Call planner.analyze_and_split, retrying once on ModelOutputError.
+
+        Returns the same tuple as analyze_and_split:
+            (plan_run, is_split, plan_text, sub_tasks, complexity)
+
+        On the first ModelOutputError the model is called again.  If the
+        second attempt also fails, the error propagates and the outer
+        handler marks the task FAILED.
+        """
+        try:
+            return self.planner.analyze_and_split(
+                title=task.title,
+                description=task.description,
+                repo_path=repo_path,
+            )
+        except ModelOutputError as first_err:
+            log.warning(
+                "Task [%s] planner output unparseable, retrying once: %s",
+                task.id, first_err,
+            )
+            try:
+                return self.planner.analyze_and_split(
+                    title=task.title,
+                    description=task.description,
+                    repo_path=repo_path,
+                )
+            except ModelOutputError as second_err:
+                raise ModelOutputError(
+                    f"Task [{task.id}] planner failed after retry: {second_err}"
+                ) from second_err
+
+    def _analyze_todo_with_retry(self, item, repo_path: str):
+        """Call planner.analyze_todo, retrying once on ModelOutputError.
+
+        Returns the same tuple as analyze_todo:
+            (agent_run, feasibility, difficulty, note)
+        """
+        try:
+            return self.planner.analyze_todo(item, repo_path)
+        except ModelOutputError as first_err:
+            log.warning(
+                "Todo [%s] analyzer output unparseable, retrying once: %s",
+                item.id, first_err,
+            )
+            try:
+                return self.planner.analyze_todo(item, repo_path)
+            except ModelOutputError as second_err:
+                raise ModelOutputError(
+                    f"Todo [{item.id}] analyzer failed after retry: {second_err}"
+                ) from second_err
+
     def _execute_task(self, task_id: str):
         """Full pipeline: plan → code → review (with retry)."""
         task = self.db.get_task(task_id)
@@ -939,11 +989,7 @@ class Orchestrator:
             self.db.save_task(task)
 
             plan_run, is_split, plan_text, sub_tasks, complexity = \
-                self.planner.analyze_and_split(
-                    title=task.title,
-                    description=task.description,
-                    repo_path=repo_path,
-                )
+                self._plan_with_retry(task, repo_path)
             self.db.save_agent_run(plan_run)
             task.complexity = complexity
             if plan_run.session_id:
@@ -970,35 +1016,21 @@ class Orchestrator:
                         max_retries=int(self.config.get("orchestrator", {}).get("max_retries", 4)),
                     )
                     children.append(child)
-                # Pass 2: resolve depends_on indices → real IDs, persist, populate maps
-                child_ids = set()
-                for idx, (child, st) in enumerate(zip(children, sub_tasks)):
-                    raw_deps = st.get("depends_on", [])
-                    resolved: List[str] = []
-                    for dep_idx in raw_deps:
-                        if isinstance(dep_idx, int) and 0 <= dep_idx < len(children) and dep_idx != idx:
-                            resolved.append(children[dep_idx].id)
-                        else:
-                            log.warning(
-                                "Task [%s] sub-task %d has invalid depends_on entry %r — skipped",
-                                task.id, idx, dep_idx,
-                            )
+                # Pass 2: resolve depends_on indices → real IDs, persist
+                # (raises ModelOutputError on invalid entries; already retried above)
+                child_id_list = [c.id for c in children]
+                resolved_deps = self.dep_tracker.resolve_indices(child_id_list, sub_tasks)
+                for child, resolved in zip(children, resolved_deps):
                     child.depends_on = resolved
                     self.db.save_task(child)
-                    child_ids.add(child.id)
-                    # Populate in-memory maps
-                    if resolved:
-                        self._pending_deps[child.id] = set(resolved)
-                        for dep_id in resolved:
-                            self._reverse_deps.setdefault(dep_id, set()).add(child.id)
                     log.info(
                         "Created sub-task [%s] '%s' depends_on=%s",
                         child.id, child.title, resolved,
                     )
-                self._children_of[task.id] = child_ids
+                self.dep_tracker.register(task.id, children)
                 # Pass 3: dispatch unblocked sub-tasks
                 for child in children:
-                    if child.id not in self._pending_deps:
+                    if not self.dep_tracker.is_blocked(child.id):
                         self.dispatch_task(child.id)
                     else:
                         log.info(
@@ -1165,32 +1197,6 @@ class Orchestrator:
             with self._lock:
                 self._futures.pop(task_id, None)
 
-    def _cleanup_dep_maps(self, task_id: str):
-        """Remove task_id from all dependency maps (called on cancel/fail)."""
-        # Remove as a waiter
-        removed_deps = self._pending_deps.pop(task_id, set())
-        for dep_id in removed_deps:
-            rev = self._reverse_deps.get(dep_id)
-            if rev:
-                rev.discard(task_id)
-                if not rev:
-                    del self._reverse_deps[dep_id]
-        # Remove as a dependency (don't auto-dispatch — cancelled dep means
-        # dependents stay blocked; parent will be marked failed/cancelled)
-        self._reverse_deps.pop(task_id, None)
-
-    def _unblock_dependents(self, completed_task_id: str):
-        """Remove completed_task_id from every dependent's pending set.
-        Dispatch any dependent whose pending set becomes empty."""
-        waiting = self._reverse_deps.pop(completed_task_id, set())
-        for dep_task_id in waiting:
-            pending = self._pending_deps[dep_task_id]
-            pending.discard(completed_task_id)
-            if not pending:
-                del self._pending_deps[dep_task_id]
-                log.info("Unblocking sub-task [%s] — all deps satisfied", dep_task_id)
-                self.dispatch_task(dep_task_id)
-
     def _update_parent_status(self, task_id: str):
         """If task has a parent, unblock dependents and check whether all
         children have reached a terminal state to update the parent.
@@ -1204,9 +1210,11 @@ class Orchestrator:
         if not task or not task.parent_id:
             return
         if task.status == TaskStatus.COMPLETED:
-            self._unblock_dependents(task_id)
+            for unblocked_id in self.dep_tracker.on_completed(task_id):
+                log.info("Unblocking sub-task [%s] — all deps satisfied", unblocked_id)
+                self.dispatch_task(unblocked_id)
         parent_id = task.parent_id
-        child_ids = self._children_of.get(parent_id)
+        child_ids = self.dep_tracker.get_children(parent_id)
         if not child_ids:
             return
         statuses = set()
@@ -1235,9 +1243,8 @@ class Orchestrator:
 
         Returns False (without dispatching) if the task has unmet dependencies.
         """
-        if task_id in self._pending_deps:
-            log.info("Task [%s] has unmet deps %s — not dispatching yet",
-                     task_id, self._pending_deps[task_id])
+        if self.dep_tracker.is_blocked(task_id):
+            log.info("Task [%s] blocked by dependencies — not dispatching yet", task_id)
             return False
         with self._lock:
             if task_id in self._futures:

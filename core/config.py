@@ -1,5 +1,6 @@
 """Configuration loading and validation."""
 
+import copy
 import os
 import yaml
 
@@ -41,7 +42,7 @@ DEFAULT_CONFIG = {
 
 def load_config(config_path: str = None) -> dict:
     """Load configuration from YAML file, falling back to defaults."""
-    config = dict(DEFAULT_CONFIG)
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if config_path is None:
         config_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

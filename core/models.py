@@ -7,6 +7,14 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
 
+class ModelOutputError(Exception):
+    """Raised when a model's output cannot be parsed into the expected format.
+
+    The orchestrator catches this to retry the model call once, then fails the
+    task if the second attempt also produces unparseable output.
+    """
+
+
 class TaskStatus(str, enum.Enum):
     PENDING = "pending"
     PLANNING = "planning"

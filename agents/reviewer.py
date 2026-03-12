@@ -73,8 +73,8 @@ class ReviewerAgent(BaseAgent):
         if "REQUEST_CHANGES" in text_upper:
             return False
         # Heuristic: look for positive signals
-        positive = ["lgtm", "looks good", "approved", "no issues"]
-        negative = ["bug", "error", "incorrect", "wrong", "missing", "should be"]
+        positive = ["LGTM", "LOOKS GOOD", "APPROVED", "NO ISSUES"]
+        negative = ["BUG", "ERROR", "INCORRECT", "WRONG", "MISSING", "SHOULD BE"]
         pos_count = sum(1 for p in positive if p in text_upper)
         neg_count = sum(1 for n in negative if n in text_upper)
         return pos_count > neg_count

@@ -650,6 +650,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="modal-overlay" id="add-modal">
   <div class="modal">
     <h2>Submit Task</h2>
+    <div id="add-task-base-branch-banner" style="margin-bottom:12px;padding:10px 12px;border:1px solid var(--yellow);border-radius:8px;background:rgba(245,158,11,0.08);color:var(--yellow);font-size:12px;line-height:1.5">
+      <div style="font-weight:700;margin-bottom:4px">Base branch notice</div>
+      <div>
+        New task worktrees are created from the configured base branch
+        <code id="add-task-base-branch-name">loading...</code>
+        (remote ref <code id="add-task-base-branch-ref">origin/loading...</code>), not from your current local checkout branch.
+      </div>
+    </div>
     <div class="tab-bar" id="add-task-tabs">
       <div class="tab active" onclick="switchAddTab(this, 'add-develop')">Develop</div>
       <div class="tab" onclick="switchAddTab(this, 'add-review')">Review</div>
@@ -1189,7 +1197,33 @@ function toggleRun(header) {
   if (body.classList.contains('open')) body.scrollTop = 0;
 }
 
-function showAddTask() { document.getElementById('add-modal').classList.add('active'); }
+let _addTaskBaseBranch = '';
+
+async function refreshAddTaskBaseBranch() {
+  const nameEl = document.getElementById('add-task-base-branch-name');
+  const refEl = document.getElementById('add-task-base-branch-ref');
+  if (!nameEl || !refEl) return;
+  if (_addTaskBaseBranch) {
+    nameEl.textContent = _addTaskBaseBranch;
+    refEl.textContent = `origin/${_addTaskBaseBranch}`;
+    return;
+  }
+  try {
+    const cfg = await api('/api/config');
+    const baseBranch = cfg && cfg.base_branch ? cfg.base_branch : 'master';
+    _addTaskBaseBranch = baseBranch;
+    nameEl.textContent = baseBranch;
+    refEl.textContent = `origin/${baseBranch}`;
+  } catch (e) {
+    nameEl.textContent = 'master';
+    refEl.textContent = 'origin/master';
+  }
+}
+
+function showAddTask() {
+  document.getElementById('add-modal').classList.add('active');
+  refreshAddTaskBaseBranch();
+}
 function closeModals() { document.querySelectorAll('.modal-overlay').forEach(m=>m.classList.remove('active')); }
 
 function uiAlert(message, title = 'Notice') {
@@ -1455,6 +1489,7 @@ async function loadSysInfo() {
     content.innerHTML = `<span style="color:var(--red)">${esc(cfg.error)}</span>`;
     return;
   }
+  _addTaskBaseBranch = cfg.base_branch || '';
   const models = (modelsResp && modelsResp.models) ? modelsResp.models : [];
 
   const complexityColors = {

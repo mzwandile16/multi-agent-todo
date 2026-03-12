@@ -2,6 +2,17 @@
 
 A persistent, daemon-based multi-agent system that leverages [opencode](https://opencode.ai) to **automatically discover, plan, implement, and review code changes** across a codebase. Multiple tasks run in parallel, each in its own `git worktree`, driven by a **Planner → Coder → Reviewer** pipeline with configurable models and retry logic.
 
+## Why This Project?
+
+Tools like **Cursor** and **opencode** are powerful single-task coding assistants, but they operate in a single conversation at a time — you drive each interaction manually, and parallelism requires you to manage multiple terminal windows or editor tabs yourself. This project fills a different niche:
+
+- **Batch autonomy** — Submit multiple tasks (or let the system discover them from TODO comments) and walk away. The daemon plans, codes, and reviews them concurrently without human babysitting.
+- **Built-in quality gate** — Every code change is reviewed by one or more AI reviewers before it's considered done. Failed reviews automatically trigger retries with the reviewer's feedback, creating a self-correcting loop that a single-assistant workflow can't provide.
+- **Persistent state** — Tasks, agent runs, and review history are stored in SQLite. You can stop the daemon, reboot, and resume exactly where you left off. Cursor/opencode sessions are ephemeral.
+- **Repository-scale isolation** — Each task runs in its own git worktree and branch, so parallel tasks never conflict. Publishing is a one-click push.
+
+In short: Cursor and opencode are excellent *interactive copilots*; this project is an *autonomous task queue* that orchestrates them at scale.
+
 ## Key Features
 
 - **Automatic TODO Discovery** — Scans a repository for `TODO`/`FIXME` comments, then uses an AI analyzer to score each by feasibility and difficulty, producing a prioritized backlog.
@@ -170,34 +181,19 @@ See [`config.yaml.template`](config.yaml.template) for a full annotated template
 | `publish` | Git remote for pushing completed branches |
 | `hook_env` | Environment variables injected into worktree hook scripts |
 
-## Project Structure
+## Testing
 
-```
-multi-agent-todo/
-├── cli.py                  # CLI entry point (argparse)
-├── daemon.py               # Background daemon with signal handling
-├── config.yaml             # User configuration (git-ignored)
-├── config.yaml.template    # Annotated config template
-├── requirements.txt        # Python dependencies
-├── core/
-│   ├── config.py           # Config loading with deep merge
-│   ├── models.py           # Dataclasses: Task, AgentRun, TodoItem
-│   ├── database.py         # SQLite persistence layer
-│   ├── worktree.py         # Git worktree create/remove/publish/hooks
-│   ├── opencode_client.py  # opencode CLI wrapper with auto-continue
-│   └── orchestrator.py     # Central orchestrator: dispatch, lifecycle, cleanup
-├── agents/
-│   ├── base.py             # BaseAgent (opencode invocation)
-│   ├── prompts.py          # All prompt templates (tune agent behavior here)
-│   ├── planner.py          # PlannerAgent: plan tasks, analyze TODOs
-│   ├── coder.py            # CoderAgent: implement & retry with feedback
-│   └── reviewer.py         # ReviewerAgent: review diffs & patches
-├── web/
-│   └── app.py              # FastAPI app + embedded HTML/JS dashboard
-├── docs/                   # Screenshots and documentation assets
-├── data/                   # SQLite DB, PID file (auto-created)
-├── logs/                   # Timestamped log files (auto-created)
-└── worktrees/              # Git worktrees (auto-created, auto-cleaned)
+The project uses [pytest](https://pytest.org) with tests in `tests/`. All model I/O is mocked — tests are fast and need no external services.
+
+```bash
+# Run all tests
+python -m pytest tests/ -v
+
+# Run a specific test module
+python -m pytest tests/test_dep_tracker.py -v
+
+# Run with short summary
+python -m pytest tests/ --tb=short
 ```
 
 ## Adapting to Another Repository

@@ -14,7 +14,7 @@ from agents.prompts import (
     planner_plan_task,
     planner_decompose_task,
 )
-from core.models import AgentRun, Task, TaskPriority, TaskSource, TodoItem, TodoItemStatus
+from core.models import AgentRun, ModelOutputError, Task, TaskPriority, TaskSource, TodoItem, TodoItemStatus
 from core.opencode_client import OpenCodeClient
 
 log = logging.getLogger(__name__)
@@ -125,25 +125,31 @@ class PlannerAgent(BaseAgent):
             item.id, elapsed, run.exit_code, text[:500],
         )
 
-        feasibility = -1.0
-        difficulty = -1.0
-        note = ""
-        try:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            # Model gave plain text without JSON — acceptable for analysis,
+            # caller sees -1 scores and raw text as note.
+            log.warning("Analyzer output for todo [%s] contained no JSON object", item.id)
+            feasibility = -1.0
+            difficulty = -1.0
+            note = text[:300]
+        else:
+            try:
                 data = json.loads(match.group())
+            except json.JSONDecodeError as e:
+                raise ModelOutputError(
+                    f"analyze_todo [{item.id}]: model output contains braces but "
+                    f"invalid JSON: {e}"
+                ) from e
+            try:
                 feasibility = float(data.get("feasibility_score", -1))
                 difficulty = float(data.get("difficulty_score", -1))
-                note = str(data.get("note", ""))
-            else:
-                log.warning("Analyzer output for todo [%s] contained no JSON object", item.id)
-                note = text[:300]
-        except (json.JSONDecodeError, ValueError) as e:
-            log.warning(
-                "Failed to parse analyzer output for todo [%s]: %s\nRaw text: %s",
-                item.id, e, text[:300],
-            )
-            note = text[:300]
+            except (ValueError, TypeError) as e:
+                raise ModelOutputError(
+                    f"analyze_todo [{item.id}]: score values not convertible to "
+                    f"float: {e}"
+                ) from e
+            note = str(data.get("note", ""))
 
         log.info(
             "Analyzer done for todo [%s]: feasibility=%.1f difficulty=%.1f note=%r (%.1fs)",
@@ -168,23 +174,31 @@ class PlannerAgent(BaseAgent):
         run = self.run(prompt, repo_path)
         text = self.get_text(run)
 
-        is_split = False
-        plan_text = ""
-        sub_tasks: List[dict] = []
-        complexity = ""
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise ModelOutputError(
+                f"analyze_and_split: no JSON object found in model output "
+                f"(first 200 chars: {text[:200]!r})"
+            )
         try:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                complexity = str(data.get("complexity", ""))
-                is_split = bool(data.get("split", False))
-                if is_split:
-                    sub_tasks = data.get("sub_tasks", [])
-                else:
-                    plan_text = data.get("plan", text)
-        except (json.JSONDecodeError, AttributeError) as e:
-            log.warning("Failed to parse analyze_and_split output: %s", e)
-            plan_text = text
+            data = json.loads(match.group())
+        except json.JSONDecodeError as e:
+            raise ModelOutputError(
+                f"analyze_and_split: invalid JSON in model output: {e}"
+            ) from e
+
+        complexity = str(data.get("complexity", ""))
+        is_split = bool(data.get("split", False))
+        if is_split:
+            sub_tasks = data.get("sub_tasks", [])
+            if not sub_tasks:
+                raise ModelOutputError(
+                    "analyze_and_split: model set split=true but provided no sub_tasks"
+                )
+            plan_text = ""
+        else:
+            sub_tasks = []
+            plan_text = data.get("plan", text)
         return run, is_split, plan_text, sub_tasks, complexity
 
     def plan_task(self, task: Task, repo_path: str) -> Tuple[AgentRun, str]:
@@ -217,14 +231,20 @@ class PlannerAgent(BaseAgent):
         run = self.run(prompt, repo_path)
         text = self.get_text(run)
 
-        # Try to parse JSON from the response
-        sub_tasks = []
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            raise ModelOutputError(
+                f"decompose_complex_task: no JSON array found in model output "
+                f"(first 200 chars: {text[:200]!r})"
+            )
         try:
-            # Find JSON array in response
-            match = re.search(r"\[.*\]", text, re.DOTALL)
-            if match:
-                sub_tasks = json.loads(match.group())
-        except (json.JSONDecodeError, AttributeError) as e:
-            log.warning("Failed to parse planner output as JSON: %s", e)
-
+            sub_tasks = json.loads(match.group())
+        except json.JSONDecodeError as e:
+            raise ModelOutputError(
+                f"decompose_complex_task: invalid JSON array in model output: {e}"
+            ) from e
+        if not isinstance(sub_tasks, list) or not sub_tasks:
+            raise ModelOutputError(
+                "decompose_complex_task: model output parsed but produced no sub-tasks"
+            )
         return run, sub_tasks
